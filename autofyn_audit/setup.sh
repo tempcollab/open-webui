@@ -37,10 +37,13 @@ python3 "${SCRIPT_DIR}/test_environment.py" \
     --no-teardown
 
 echo
-echo "[*] To run the new exploit scripts:"
+echo "[*] To run the exploit scripts:"
 echo "    python3 autofyn_audit/exploit_cors_origin_reflection.py    --target http://localhost:${PORT}"
 echo "    python3 autofyn_audit/exploit_token_revocation_bypass.py   --target http://localhost:${PORT}"
 echo "    python3 autofyn_audit/exploit_oauth_cookie_httponly.py     --target http://localhost:${PORT}"
 echo "    python3 autofyn_audit/exploit_cors_chain.py                --target http://localhost:${PORT}"
+echo "    python3 autofyn_audit/exploit_mermaid_xss.py               --target http://localhost:${PORT}"
+echo "    python3 autofyn_audit/exploit_pip_injection.py             --target http://localhost:${PORT}"
+echo "    python3 autofyn_audit/exploit_full_rce_chain.py            --target http://localhost:${PORT}"
 echo
 echo "[*] To tear down: ./autofyn_audit/teardown.sh"

