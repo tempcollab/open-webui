@@ -45,5 +45,7 @@ echo "    python3 autofyn_audit/exploit_cors_chain.py                --target ht
 echo "    python3 autofyn_audit/exploit_mermaid_xss.py               --target http://localhost:${PORT}"
 echo "    python3 autofyn_audit/exploit_pip_injection.py             --target http://localhost:${PORT}"
 echo "    python3 autofyn_audit/exploit_full_rce_chain.py            --target http://localhost:${PORT}"
+echo "    python3 autofyn_audit/exploit_ssrf_rag.py                  --target http://localhost:${PORT} --token <verified_user_token>"
+echo "    python3 autofyn_audit/exploit_tool_exec_rce.py             --target http://localhost:${PORT}"
 echo
 echo "[*] To tear down: ./autofyn_audit/teardown.sh"
