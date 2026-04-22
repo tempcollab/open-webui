@@ -4,3 +4,4 @@ __pycache__/
 *.db
 *.csv
 evidence/stolen_*
+evidence/exploit_*

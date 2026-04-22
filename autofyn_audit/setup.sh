@@ -3,29 +3,21 @@
 #
 # Wraps test_environment.py --no-teardown.
 # Container: openwebui-security-test
-# Modes:
-#   forced-default-secret  -> explicitly sets WEBUI_SECRET_KEY=t0p-s3cr3t for F1/F10/F12 chain testing
-#   default-docker         -> stock startup behavior with generated/random secret
+# Secret:    WEBUI_SECRET_KEY=t0p-s3cr3t (for compatibility with all exploit scripts)
 #
 # Usage:
-#   ./setup.sh [port] [mode]     defaults: 8080 forced-default-secret
+#   ./setup.sh [port]     default port: 8080
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${1:-8080}"
-MODE="${2:-forced-default-secret}"
 
 echo "========================================"
 echo "  Open WebUI Security Audit — Setup"
 echo "  Container : openwebui-security-test"
 echo "  Port      : ${PORT}"
-echo "  Mode      : ${MODE}"
-if [[ "${MODE}" == "forced-default-secret" ]]; then
-    echo "  Secret    : t0p-s3cr3t (explicit lab mode)"
-else
-    echo "  Secret    : stock startup behavior"
-fi
+echo "  Secret    : t0p-s3cr3t"
 echo "========================================"
 echo
 
@@ -42,18 +34,10 @@ fi
 echo "[*] Launching test environment via test_environment.py..."
 python3 "${SCRIPT_DIR}/test_environment.py" \
     --port "${PORT}" \
-    --mode "${MODE}" \
     --no-teardown
 
 echo
 echo "[*] To run the exploit scripts:"
-if [[ "${MODE}" == "forced-default-secret" ]]; then
-    echo "    JWT-dependent chain scripts are expected to work in this lab mode."
-else
-    echo "    JWT-dependent chain scripts will fail here unless the deployment actually uses the public default secret."
-fi
-echo "    After the first admin is created, public signup is disabled by current startup."
-echo "    Prefer --token / --user-token / --admin-id on scripts that support them."
 echo "    python3 autofyn_audit/exploit_cors_origin_reflection.py    --target http://localhost:${PORT}"
 echo "    python3 autofyn_audit/exploit_token_revocation_bypass.py   --target http://localhost:${PORT}"
 echo "    python3 autofyn_audit/exploit_oauth_cookie_httponly.py     --target http://localhost:${PORT}"
