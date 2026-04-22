@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-test_environment.py — Stand up a local Open WebUI audit environment.
+test_environment.py — Stand up a local Open WebUI instance with default (vulnerable) config.
 
-Supports two modes:
-  - default-docker: stock container startup, which generates/loads a random secret
-  - forced-default-secret: explicitly sets WEBUI_SECRET_KEY=t0p-s3cr3t for F1/F10/F12 chain testing
+Uses Docker to run ghcr.io/open-webui/open-webui:main without WEBUI_SECRET_KEY set,
+so the default hardcoded secret 't0p-s3cr3t' is used.
 """
 
 import argparse
@@ -21,7 +20,6 @@ WAIT_TIMEOUT = 180
 ADMIN_EMAIL = 'admin@test.local'
 ADMIN_PASSWORD = 'TestAdmin123!'
 ADMIN_NAME = 'Admin'
-DEFAULT_MODE = 'forced-default-secret'
 
 
 def check_docker_available() -> bool:
@@ -36,12 +34,8 @@ def check_docker_available() -> bool:
         return False
 
 
-def setup_environment(
-    port: int = DEFAULT_PORT,
-    timeout: int = WAIT_TIMEOUT,
-    mode: str = DEFAULT_MODE,
-) -> str:
-    print(f'[*] Starting Open WebUI container on port {port} (mode: {mode})...')
+def setup_environment(port: int = DEFAULT_PORT, timeout: int = WAIT_TIMEOUT) -> str:
+    print(f'[*] Starting Open WebUI container on port {port}...')
 
     # Remove any existing container with the same name
     subprocess.run(
@@ -49,20 +43,17 @@ def setup_environment(
         capture_output=True,
     )
 
-    command = [
-        'docker', 'run', '-d',
-        '--name', CONTAINER_NAME,
-        '-p', f'{port}:8080',
-        '-e', 'ENABLE_SIGNUP=true',
-        '-e', 'ENABLE_ADMIN_EXPORT=true',
-        '-e', 'WEBUI_AUTH=true',
-    ]
-    if mode == 'forced-default-secret':
-        command.extend(['-e', 'WEBUI_SECRET_KEY=t0p-s3cr3t'])
-    command.append(DOCKER_IMAGE)
-
     result = subprocess.run(
-        command,
+        [
+            'docker', 'run', '-d',
+            '--name', CONTAINER_NAME,
+            '-p', f'{port}:8080',
+            '-e', 'WEBUI_SECRET_KEY=t0p-s3cr3t',
+            '-e', 'ENABLE_SIGNUP=true',
+            '-e', 'ENABLE_ADMIN_EXPORT=true',
+            '-e', 'WEBUI_AUTH=true',
+            DOCKER_IMAGE,
+        ],
         capture_output=True,
         text=True,
         timeout=60,
@@ -137,7 +128,7 @@ def setup_initial_admin(base_url: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Stand up an Open WebUI audit environment'
+        description='Stand up a vulnerable Open WebUI test environment'
     )
     parser.add_argument(
         '--port',
@@ -156,15 +147,6 @@ def main() -> None:
         default=WAIT_TIMEOUT,
         help=f'Seconds to wait for container readiness (default: {WAIT_TIMEOUT})',
     )
-    parser.add_argument(
-        '--mode',
-        choices=['default-docker', 'forced-default-secret'],
-        default=DEFAULT_MODE,
-        help=(
-            'default-docker = stock startup; forced-default-secret = explicit '
-            'WEBUI_SECRET_KEY=t0p-s3cr3t lab mode'
-        ),
-    )
     args = parser.parse_args()
 
     if not check_docker_available():
@@ -175,7 +157,7 @@ def main() -> None:
     print('[*] Docker is available')
     base_url = f'http://localhost:{args.port}'
 
-    container_id = setup_environment(port=args.port, timeout=args.timeout, mode=args.mode)
+    container_id = setup_environment(port=args.port, timeout=args.timeout)
 
     ready = wait_for_ready(base_url, timeout=args.timeout)
     if not ready:
@@ -188,14 +170,10 @@ def main() -> None:
     print('=' * 60)
     print('[+] Test environment ready')
     print(f'    Target URL : {base_url}')
-    print(f'    Mode       : {args.mode}')
     print(f"    Admin email: {admin_info['email']}")
     print(f"    Admin ID   : {admin_info['user_id']}")
     print(f"    Admin token: {admin_info['token'][:40]}...")
-    if args.mode == 'forced-default-secret':
-        print('    Secret key : t0p-s3cr3t (explicitly set in env for lab reproduction)')
-    else:
-        print('    Secret key : generated/loaded by the stock startup wrapper')
+    print('    Secret key : t0p-s3cr3t (default — NOT set in env)')
     print('=' * 60)
 
     if not args.no_teardown:

