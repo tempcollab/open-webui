@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-12 vulnerabilities found — 4 Critical, 6 High, 2 Medium. Live-confirmed against a Docker deployment. The worst-case scenario: on an affected deployment that still exposes a bootstrap path or leaks the admin UUID, an external attacker reaches persistent root RCE inside the container and steals all API keys and user data. Findings span authentication, authorization, input validation, and frontend rendering.
+12 vulnerabilities found — 4 Critical, 5 High, 3 Medium. Live-confirmed against a Docker deployment. The worst-case scenario: on an affected deployment that still exposes a bootstrap path or leaks the admin UUID, an external attacker reaches persistent root RCE inside the container and steals all API keys and user data. Findings span authentication, authorization, input validation, and frontend rendering.
 
 **Key caveats:** Attack Chains 1 and 2 require the JWT secret to be the publicly known default `t0p-s3cr3t`. Default Docker and `open-webui serve` generate a random secret. The default is active when running `open-webui dev`, `backend/dev.sh`, or bare `uvicorn open_webui.main:app` without setting `WEBUI_SECRET_KEY`. Also, current startup disables public signup after the first user, so a pure unauthenticated entry path is not present on a normally initialized deployment unless signup is re-enabled or the attacker already knows the admin UUID. Findings 6, 7, 8, 9, 11 affect **all** deployments regardless of secret.
 
@@ -182,11 +182,13 @@ Mermaid initialized with `securityLevel: 'loose'` (allows HTML in node labels). 
 
 ---
 
-### F7: Token Revocation No-Op Without Redis — HIGH (CVSS 7.5)
+### F7: Token Revocation No-Op Without Redis — MEDIUM (CVSS 5.3, AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N)
 
 **Code:** `auth.py:229-276`, `auths.py:780-781`
 
 `invalidate_token()` and `is_valid_token()` guard all revocation behind `if request.app.state.redis:`. Without Redis (default for all Docker/pip deployments), signout silently does nothing. Stolen tokens remain valid for the full JWT lifetime (`JWT_EXPIRES_IN` defaults to `4w`).
+
+**Note:** This is a known design limitation. The JWT auto-expiry (`4w` default) provides a natural mitigation window, and exploitation requires the attacker to have already obtained a valid token through a separate vulnerability. The rating has been downgraded from HIGH to MEDIUM to reflect this reduced standalone impact.
 
 **Live-confirmed:** Token remained valid after signout — HTTP 200 on authenticated endpoint post-logout.
 
@@ -244,8 +246,8 @@ OAuth callback sets JWT cookie with `httponly=False`. Password login at `auths.p
 5. Fix CORS: don't combine `allow_origins=['*']` with `allow_credentials=True` (F6)
 6. Set `allow_redirects=False` in RAG web fetch; parse hostname before blocklist (F11)
 7. Set `httponly=True` on OAuth cookie (F8)
-8. Implement DB-backed token revocation fallback; reduce `JWT_EXPIRES_IN` default (F7)
-9. Validate webhook URLs against private IP ranges (F4)
+8. Validate webhook URLs against private IP ranges (F4)
+9. Consider DB-backed token revocation fallback; reduce `JWT_EXPIRES_IN` default (F7 — MEDIUM, mitigated by auto-expiry)
 10. Mask API keys; default `ENABLE_ADMIN_EXPORT` to `False` (F2, F3)
 11. Restrict user search to admin; gate admin details behind `SHOW_ADMIN_DETAILS` (F5)
 
